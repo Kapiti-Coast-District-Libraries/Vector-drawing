@@ -1,5 +1,5 @@
 {
-  "name": "Vector Craft Studio",
+  "name": "Kāpiti Libraries Vector Design",
   "description": "A precise vector drawing and tracing application featuring advanced pen tools, bezier curve node editing, layer controls, boolean pathfinder operators, grid snapping, and clean SVG export.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

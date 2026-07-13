@@ -49,7 +49,7 @@ export interface TracingImage {
   locked: boolean;
 }
 
-export type ToolType = 'select' | 'direct-select' | 'pen' | 'rect' | 'ellipse' | 'spiral' | 'eraser';
+export type ToolType = 'select' | 'direct-select' | 'pen' | 'rect' | 'ellipse' | 'triangle' | 'spiral' | 'eraser';
 
 export interface GridConfig {
   size: number;
@@ -60,4 +60,11 @@ export interface GridConfig {
 export interface SnapConfig {
   points: boolean;
   grid: boolean;
+}
+
+export interface AlignmentGuide {
+  type: 'horizontal' | 'vertical';
+  coord: number;
+  minVal: number;
+  maxVal: number;
 }

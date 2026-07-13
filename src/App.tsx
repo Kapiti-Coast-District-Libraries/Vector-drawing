@@ -4,6 +4,7 @@ import {
   PenTool,
   Square,
   Circle,
+  Triangle,
   Trash2,
   Download,
   Eye,
@@ -38,7 +39,8 @@ import {
   ToolType,
   GridConfig,
   SnapConfig,
-  NodeType
+  NodeType,
+  AlignmentGuide
 } from './types';
 import {
   getPathData,
@@ -124,6 +126,35 @@ export default function App() {
     startNodes: VectorNode[];
   } | null>(null);
   const [dragImageStartPos, setDragImageStartPos] = useState<{ x: number; y: number } | null>(null);
+
+  // --- New Illustrator-style selection box and middle-click panning states ---
+  const [selectionBox, setSelectionBox] = useState<{ start: Point; current: Point } | null>(null);
+  const [isMiddleClickPanning, setIsMiddleClickPanning] = useState<boolean>(false);
+  const selectionStartWithShiftRef = useRef<boolean>(false);
+  const initialSelectedIdsRef = useRef<string[]>([]);
+
+  // --- Resizing / Transforming States ---
+  const [isResizing, setIsResizing] = useState<boolean>(false);
+  const [resizingHandle, setResizingHandle] = useState<string | null>(null);
+  const [resizeStartBox, setResizeStartBox] = useState<{
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+    width: number;
+    height: number;
+    centerX: number;
+    centerY: number;
+  } | null>(null);
+  const [activeGuides, setActiveGuides] = useState<AlignmentGuide[]>([]);
+
+  // --- Illustrator-style repeat-transform (Ctrl+D) states ---
+  const [lastTransform, setLastTransform] = useState<{ type: 'move' | 'duplicate'; dx: number; dy: number }>({
+    type: 'duplicate',
+    dx: 30,
+    dy: 30,
+  });
+  const currentDragDeltaRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
   // --- Drag-over Overlay for file tracing loading ---
   const [isDragOverCanvas, setIsDragOverCanvas] = useState<boolean>(false);
@@ -330,6 +361,55 @@ export default function App() {
     setCopiedElements(newPastedElements);
   };
 
+  const handleRepeatTransform = () => {
+    if (selectedElementIds.length === 0) return;
+    const selectedEls = getAllElements().filter(el => selectedElementIds.includes(el.id));
+    if (selectedEls.length === 0) return;
+
+    const dx = lastTransform.dx;
+    const dy = lastTransform.dy;
+
+    const newRepeatedElements = selectedEls.map(el => {
+      const newNodes = el.nodes.map(node => {
+        const anchor = { x: node.anchor.x + dx, y: node.anchor.y + dy };
+        const handleIn = node.handleIn
+          ? { x: node.handleIn.x + dx, y: node.handleIn.y + dy }
+          : undefined;
+        const handleOut = node.handleOut
+          ? { x: node.handleOut.x + dx, y: node.handleOut.y + dy }
+          : undefined;
+        return {
+          ...node,
+          id: `node-${Math.random().toString(36).substr(2, 5)}`,
+          anchor,
+          handleIn,
+          handleOut,
+        };
+      });
+      return {
+        ...el,
+        id: `el-${Math.random().toString(36).substr(2, 9)}`,
+        name: `${el.name} (Repeat)`,
+        nodes: newNodes,
+      };
+    });
+
+    setLayers(prev =>
+      prev.map(layer => {
+        if (layer.id === activeLayerId) {
+          return {
+            ...layer,
+            elements: [...layer.elements, ...newRepeatedElements]
+          };
+        }
+        return layer;
+      })
+    );
+
+    const newIds = newRepeatedElements.map(el => el.id);
+    setSelectedElementIds(newIds);
+  };
+
   // --- MIRROR & SYMMETRY ACTIONS ---
   const handleMirrorAction = (type: 'flip-horizontal' | 'flip-vertical' | 'mirror-horizontal' | 'mirror-vertical') => {
     if (selectedElementIds.length === 0) return;
@@ -438,8 +518,19 @@ export default function App() {
 
   // --- CANVAS SVG CLICKS ---
   const handleCanvasMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
+    // If middle click (button === 1), start middle-click panning!
+    if (e.button === 1) {
+      e.preventDefault();
+      setIsMiddleClickPanning(true);
+      setDragStartCanvasPos({ x: e.clientX, y: e.clientY });
+      setDragImageStartPos({ x: panOffset.x, y: panOffset.y });
+      return;
+    }
+
     // Only pay attention to primary clicks
     if (e.button !== 0) return;
+
+    e.preventDefault();
 
     const snappedPt = getSnappedCanvasCoords(e, activePathId || undefined);
 
@@ -533,8 +624,8 @@ export default function App() {
       return;
     }
 
-    // --- TOOL: RECTANGLE / ELLIPSE / SPIRAL FAST-GENS ---
-    if (tool === 'rect' || tool === 'ellipse' || tool === 'spiral') {
+    // --- TOOL: RECTANGLE / ELLIPSE / TRIANGLE / SPIRAL FAST-GENS ---
+    if (tool === 'rect' || tool === 'ellipse' || tool === 'triangle' || tool === 'spiral') {
       const elId = `shape-${Math.random().toString(36).substr(2, 9)}`;
       let newElement: PathElement;
 
@@ -605,6 +696,24 @@ export default function App() {
           visible: true,
           locked: false,
         };
+      } else if (tool === 'triangle') {
+        newElement = {
+          id: elId,
+          name: 'Triangle',
+          type: 'polygon',
+          nodes: [
+            { id: `tn1-${Math.random().toString(36).substr(2, 5)}`, anchor: { x: snappedPt.x, y: snappedPt.y - 50 }, type: 'corner' },
+            { id: `tn2-${Math.random().toString(36).substr(2, 5)}`, anchor: { x: snappedPt.x + 50, y: snappedPt.y + 40 }, type: 'corner' },
+            { id: `tn3-${Math.random().toString(36).substr(2, 5)}`, anchor: { x: snappedPt.x - 50, y: snappedPt.y + 40 }, type: 'corner' },
+          ],
+          closed: true,
+          fill: fillColor,
+          fillOpacity: fillOpacity,
+          stroke: strokeColor,
+          strokeWidth: strokeWidth,
+          visible: true,
+          locked: false,
+        };
       } else {
         // Fast Spiral stamp node offset
         const baseSpiral = getSpiralTemplate();
@@ -638,20 +747,138 @@ export default function App() {
       return;
     }
 
-    // --- TOOL: SELECT (Standard clicking empty starts canvas background PANNING) ---
+    // --- TOOL: SELECT (Standard clicking empty starts Illustrator marquee selection) ---
     if (tool === 'select') {
-      // If clicked empty workspace, clear element selection, start window panning
-      setSelectedElementIds([]);
+      const rawPos = getCanvasCoords(e);
       setSelectedNodeInfo(null);
+
+      // Store whether Shift was held at the start
+      selectionStartWithShiftRef.current = e.shiftKey;
+      initialSelectedIdsRef.current = e.shiftKey ? [...selectedElementIds] : [];
+
+      if (!e.shiftKey) {
+        setSelectedElementIds([]);
+      }
+
+      setSelectionBox({
+        start: rawPos,
+        current: rawPos
+      });
       setIsDragging(true);
       setDragStartCanvasPos({ x: e.clientX, y: e.clientY });
-      setDragStartElementsBackup([]);
-      setDragImageStartPos({ x: panOffset.x, y: panOffset.y });
     }
+  };
+
+  // --- ILLUSTRATOR-STYLE SCALING HELPER ---
+  const getScaleAndOrigin = (
+    handle: string,
+    dx: number,
+    dy: number,
+    box: { minX: number; maxX: number; minY: number; maxY: number; width: number; height: number; centerX: number; centerY: number },
+    shift: boolean,
+    alt: boolean
+  ) => {
+    let originX = box.centerX;
+    let originY = box.centerY;
+    let scaleX = 1;
+    let scaleY = 1;
+
+    // 1. Determine origin (fixed point)
+    if (!alt) {
+      if (handle.includes('e')) originX = box.minX;
+      else if (handle.includes('w')) originX = box.maxX;
+
+      if (handle.includes('s')) originY = box.minY;
+      else if (handle.includes('n')) originY = box.maxY;
+    }
+
+    // 2. Calculate raw scale factor based on handle
+    const w = Math.max(1, box.width);
+    const h = Math.max(1, box.height);
+
+    if (alt) {
+      // Scaling from center
+      if (handle === 'e') {
+        scaleX = (w/2 + dx) / (w/2);
+      } else if (handle === 'w') {
+        scaleX = (w/2 - dx) / (w/2);
+      } else if (handle === 's') {
+        scaleY = (h/2 + dy) / (h/2);
+      } else if (handle === 'n') {
+        scaleY = (h/2 - dy) / (h/2);
+      } else if (handle === 'se') {
+        scaleX = (w/2 + dx) / (w/2);
+        scaleY = (h/2 + dy) / (h/2);
+      } else if (handle === 'nw') {
+        scaleX = (w/2 - dx) / (w/2);
+        scaleY = (h/2 - dy) / (h/2);
+      } else if (handle === 'ne') {
+        scaleX = (w/2 + dx) / (w/2);
+        scaleY = (h/2 - dy) / (h/2);
+      } else if (handle === 'sw') {
+        scaleX = (w/2 - dx) / (w/2);
+        scaleY = (h/2 + dy) / (h/2);
+      }
+    } else {
+      // Standard scaling (from opposite side/corner)
+      if (handle === 'e') {
+        scaleX = (w + dx) / w;
+      } else if (handle === 'w') {
+        scaleX = (w - dx) / w;
+      } else if (handle === 's') {
+        scaleY = (h + dy) / h;
+      } else if (handle === 'n') {
+        scaleY = (h - dy) / h;
+      } else if (handle === 'se') {
+        scaleX = (w + dx) / w;
+        scaleY = (h + dy) / h;
+      } else if (handle === 'nw') {
+        scaleX = (w - dx) / w;
+        scaleY = (h - dy) / h;
+      } else if (handle === 'ne') {
+        scaleX = (w + dx) / w;
+        scaleY = (h - dy) / h;
+      } else if (handle === 'sw') {
+        scaleX = (w - dx) / w;
+        scaleY = (h + dy) / h;
+      }
+    }
+
+    // 3. Keep proportional if shift is held
+    if (shift) {
+      if (handle === 'e' || handle === 'w') {
+        scaleY = scaleX;
+      } else if (handle === 'n' || handle === 's') {
+        scaleX = scaleY;
+      } else {
+        const scale = (scaleX + scaleY) / 2;
+        scaleX = scale;
+        scaleY = scale;
+      }
+    }
+
+    // Avoid scaling to exactly 0 to prevent division by zero or negative flip if not wanted
+    if (Math.abs(scaleX) < 0.001) scaleX = 0.001 * Math.sign(scaleX || 1);
+    if (Math.abs(scaleY) < 0.001) scaleY = 0.001 * Math.sign(scaleY || 1);
+
+    return { scaleX, scaleY, originX, originY };
   };
 
   // Drag over Canvas move trackers
   const handleCanvasMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    // If middle-click panning is active, handle it immediately!
+    if (isMiddleClickPanning && dragImageStartPos) {
+      e.preventDefault();
+      const dx = e.clientX - dragStartCanvasPos.x;
+      const dy = e.clientY - dragStartCanvasPos.y;
+
+      setPanOffset({
+        x: dragImageStartPos.x + dx,
+        y: dragImageStartPos.y + dy,
+      });
+      return;
+    }
+
     const rawPos = getCanvasCoords(e);
     const snappedPos = getSnappedCanvasCoords(e, activePathId || undefined);
 
@@ -848,12 +1075,114 @@ export default function App() {
     }
 
     // --- CASE 3: Dragging entire selected element to move / scale (Transform editor) ---
-    if (tool === 'select' && isDragging && selectedElementIds.length > 0) {
+    if (tool === 'select' && isDragging && selectedElementIds.length > 0 && !selectionBox) {
       const currentMouseScreen = { x: e.clientX, y: e.clientY };
       const rawDelta = {
         x: (currentMouseScreen.x - dragStartCanvasPos.x) / zoom,
         y: (currentMouseScreen.y - dragStartCanvasPos.y) / zoom,
       };
+
+      let adjustedDeltaX = rawDelta.x;
+      let adjustedDeltaY = rawDelta.y;
+      const guides: AlignmentGuide[] = [];
+
+      const otherEls = getAllElements().filter(el => !selectedElementIds.includes(el.id) && el.visible);
+      if (otherEls.length > 0 && selectedElementIds.length > 0) {
+        const selectedElsBackup = dragStartElementsBackup.filter(el => selectedElementIds.includes(el.id));
+        if (selectedElsBackup.length > 0) {
+          const startBox = getCombinedBoundingBox(selectedElsBackup);
+          const otherBoxes = otherEls.map(el => getElementBoundingBox(el));
+          
+          const snapThreshold = 8 / zoom;
+
+          // Find vertical alignment (adjusting X)
+          let bestXAdjustment = 0;
+          let minDiffX = snapThreshold;
+          let targetXForGuide = null;
+          let guideYRange = { min: startBox.minY + rawDelta.y, max: startBox.maxY + rawDelta.y };
+
+          const activeXs = [
+            { val: startBox.minX + rawDelta.x, ref: 'left' },
+            { val: startBox.centerX + rawDelta.x, ref: 'center' },
+            { val: startBox.maxX + rawDelta.x, ref: 'right' }
+          ];
+
+          otherBoxes.forEach(ob => {
+            const obXs = [
+              { val: ob.minX, ref: 'left' },
+              { val: ob.centerX, ref: 'center' },
+              { val: ob.maxX, ref: 'right' }
+            ];
+            activeXs.forEach(ax => {
+              obXs.forEach(ox => {
+                const diff = ax.val - ox.val;
+                if (Math.abs(diff) < minDiffX) {
+                  minDiffX = Math.abs(diff);
+                  bestXAdjustment = -diff; // we need to subtract diff to make them equal
+                  targetXForGuide = ox.val;
+                  guideYRange.min = Math.min(guideYRange.min, ob.minY, startBox.minY + rawDelta.y);
+                  guideYRange.max = Math.max(guideYRange.max, ob.maxY, startBox.maxY + rawDelta.y);
+                }
+              });
+            });
+          });
+
+          if (targetXForGuide !== null) {
+            adjustedDeltaX += bestXAdjustment;
+            guides.push({
+              type: 'vertical',
+              coord: targetXForGuide,
+              minVal: guideYRange.min,
+              maxVal: guideYRange.max
+            });
+          }
+
+          // Find horizontal alignment (adjusting Y)
+          let bestYAdjustment = 0;
+          let minDiffY = snapThreshold;
+          let targetYForGuide = null;
+          let guideXRange = { min: startBox.minX + rawDelta.x, max: startBox.maxX + rawDelta.x };
+
+          const activeYs = [
+            { val: startBox.minY + rawDelta.y, ref: 'top' },
+            { val: startBox.centerY + rawDelta.y, ref: 'center' },
+            { val: startBox.maxY + rawDelta.y, ref: 'bottom' }
+          ];
+
+          otherBoxes.forEach(ob => {
+            const obYs = [
+              { val: ob.minY, ref: 'top' },
+              { val: ob.centerY, ref: 'center' },
+              { val: ob.maxY, ref: 'bottom' }
+            ];
+            activeYs.forEach(ay => {
+              obYs.forEach(oy => {
+                const diff = ay.val - oy.val;
+                if (Math.abs(diff) < minDiffY) {
+                  minDiffY = Math.abs(diff);
+                  bestYAdjustment = -diff;
+                  targetYForGuide = oy.val;
+                  guideXRange.min = Math.min(guideXRange.min, ob.minX, startBox.minX + rawDelta.x);
+                  guideXRange.max = Math.max(guideXRange.max, ob.maxX, startBox.maxX + rawDelta.x);
+                }
+              });
+            });
+          });
+
+          if (targetYForGuide !== null) {
+            adjustedDeltaY += bestYAdjustment;
+            guides.push({
+              type: 'horizontal',
+              coord: targetYForGuide,
+              minVal: guideXRange.min,
+              maxVal: guideXRange.max
+            });
+          }
+        }
+      }
+
+      currentDragDeltaRef.current = { x: adjustedDeltaX, y: adjustedDeltaY };
+      setActiveGuides(guides);
 
       // Limit moving to valid translation delta. Map previous states
       setLayers(prev =>
@@ -867,14 +1196,140 @@ export default function App() {
                 ...el,
                 nodes: backup.nodes.map(node => ({
                   ...node,
-                  anchor: { x: node.anchor.x + rawDelta.x, y: node.anchor.y + rawDelta.y },
+                  anchor: { x: node.anchor.x + adjustedDeltaX, y: node.anchor.y + adjustedDeltaY },
                   handleIn: node.handleIn
-                    ? { x: node.handleIn.x + rawDelta.x, y: node.handleIn.y + rawDelta.y }
+                    ? { x: node.handleIn.x + adjustedDeltaX, y: node.handleIn.y + adjustedDeltaY }
                     : undefined,
                   handleOut: node.handleOut
-                    ? { x: node.handleOut.x + rawDelta.x, y: node.handleOut.y + rawDelta.y }
+                    ? { x: node.handleOut.x + adjustedDeltaX, y: node.handleOut.y + adjustedDeltaY }
                     : undefined,
                 })),
+              };
+            }
+            return el;
+          }),
+        }))
+      );
+      return;
+    }
+
+    // --- CASE 3.5: Resizing/Transforming elements using bounding box handles ---
+    if (tool === 'select' && isResizing && resizingHandle && resizeStartBox) {
+      const currentMouseScreen = { x: e.clientX, y: e.clientY };
+      const rawDeltaX = (currentMouseScreen.x - dragStartCanvasPos.x) / zoom;
+      const rawDeltaY = (currentMouseScreen.y - dragStartCanvasPos.y) / zoom;
+
+      // Snapping during resize:
+      let adjustedDx = rawDeltaX;
+      let adjustedDy = rawDeltaY;
+      const guides: AlignmentGuide[] = [];
+
+      const otherEls = getAllElements().filter(el => !selectedElementIds.includes(el.id) && el.visible);
+      if (otherEls.length > 0 && selectedElementIds.length > 0) {
+        const otherBoxes = otherEls.map(el => getElementBoundingBox(el));
+        const snapThreshold = 8 / zoom;
+
+        // Check if we are dragging a handle that affects X
+        if (resizingHandle.includes('e') || resizingHandle.includes('w')) {
+          const activeX = resizingHandle.includes('e') ? resizeStartBox.maxX + rawDeltaX : resizeStartBox.minX + rawDeltaX;
+          let bestXAdjustment = 0;
+          let minDiffX = snapThreshold;
+          let targetXForGuide = null;
+          let guideYRange = { min: resizeStartBox.minY, max: resizeStartBox.maxY };
+
+          otherBoxes.forEach(ob => {
+            const obXs = [ob.minX, ob.centerX, ob.maxX];
+            obXs.forEach(ox => {
+              const diff = activeX - ox;
+              if (Math.abs(diff) < minDiffX) {
+                minDiffX = Math.abs(diff);
+                bestXAdjustment = -diff;
+                targetXForGuide = ox;
+                guideYRange.min = Math.min(guideYRange.min, ob.minY, resizeStartBox.minY);
+                guideYRange.max = Math.max(guideYRange.max, ob.maxY, resizeStartBox.maxY);
+              }
+            });
+          });
+
+          if (targetXForGuide !== null) {
+            adjustedDx += bestXAdjustment;
+            guides.push({
+              type: 'vertical',
+              coord: targetXForGuide,
+              minVal: guideYRange.min,
+              maxVal: guideYRange.max
+            });
+          }
+        }
+
+        // Check if we are dragging a handle that affects Y
+        if (resizingHandle.includes('s') || resizingHandle.includes('n')) {
+          const activeY = resizingHandle.includes('s') ? resizeStartBox.maxY + rawDeltaY : resizeStartBox.minY + rawDeltaY;
+          let bestYAdjustment = 0;
+          let minDiffY = snapThreshold;
+          let targetYForGuide = null;
+          let guideXRange = { min: resizeStartBox.minX, max: resizeStartBox.maxX };
+
+          otherBoxes.forEach(ob => {
+            const obYs = [ob.minY, ob.centerY, ob.maxY];
+            obYs.forEach(oy => {
+              const diff = activeY - oy;
+              if (Math.abs(diff) < minDiffY) {
+                minDiffY = Math.abs(diff);
+                bestYAdjustment = -diff;
+                targetYForGuide = oy;
+                guideXRange.min = Math.min(guideXRange.min, ob.minX, resizeStartBox.minX);
+                guideXRange.max = Math.max(guideXRange.max, ob.maxX, resizeStartBox.maxX);
+              }
+            });
+          });
+
+          if (targetYForGuide !== null) {
+            adjustedDy += bestYAdjustment;
+            guides.push({
+              type: 'horizontal',
+              coord: targetYForGuide,
+              minVal: guideXRange.min,
+              maxVal: guideXRange.max
+            });
+          }
+        }
+      }
+
+      setActiveGuides(guides);
+
+      // Perform scaling transformation relative to origin using scaleX and scaleY
+      const { scaleX, scaleY, originX, originY } = getScaleAndOrigin(
+        resizingHandle,
+        adjustedDx,
+        adjustedDy,
+        resizeStartBox,
+        e.shiftKey,
+        e.altKey
+      );
+
+      setLayers(prev =>
+        prev.map(layer => ({
+          ...layer,
+          elements: layer.elements.map(el => {
+            const backup = dragStartElementsBackup.find(b => b.id === el.id);
+            if (backup && selectedElementIds.includes(el.id)) {
+              // Scale nodes relative to origin
+              return {
+                ...el,
+                nodes: backup.nodes.map(node => {
+                  const scalePoint = (p: Point) => ({
+                    x: originX + (p.x - originX) * scaleX,
+                    y: originY + (p.y - originY) * scaleY,
+                  });
+
+                  return {
+                    ...node,
+                    anchor: scalePoint(node.anchor),
+                    handleIn: node.handleIn ? scalePoint(node.handleIn) : undefined,
+                    handleOut: node.handleOut ? scalePoint(node.handleOut) : undefined,
+                  };
+                }),
               };
             }
             return el;
@@ -906,24 +1361,56 @@ export default function App() {
       }
     }
 
-    // --- CASE 5: Canvas Background Panning (when no element is selected or space bar used) ---
-    if (tool === 'select' && isDragging && selectedElementIds.length === 0 && dragImageStartPos) {
-      const dx = e.clientX - dragStartCanvasPos.x;
-      const dy = e.clientY - dragStartCanvasPos.y;
+    // --- CASE 5: Marquee Selection Box (Illustrator style) ---
+    if (tool === 'select' && isDragging && selectionBox) {
+      const currentRaw = getCanvasCoords(e);
+      const updatedBox = { ...selectionBox, current: currentRaw };
+      setSelectionBox(updatedBox);
 
-      setPanOffset({
-        x: dragImageStartPos.x + dx,
-        y: dragImageStartPos.y + dy,
-      });
+      // Calculate bounds of selection box
+      const xMin = Math.min(updatedBox.start.x, updatedBox.current.x);
+      const xMax = Math.max(updatedBox.start.x, updatedBox.current.x);
+      const yMin = Math.min(updatedBox.start.y, updatedBox.current.y);
+      const yMax = Math.max(updatedBox.start.y, updatedBox.current.y);
+
+      // Find all elements within layer(s) that intersect this box
+      const intersectingElIds = getAllElements()
+        .filter(el => {
+          if (!el.visible || el.locked) return false;
+          const box = getElementBoundingBox(el);
+          // Standard box intersection test:
+          return !(box.maxX < xMin || box.minX > xMax || box.maxY < yMin || box.minY > yMax);
+        })
+        .map(el => el.id);
+
+      const baseIds = selectionStartWithShiftRef.current ? initialSelectedIdsRef.current : [];
+      const combined = Array.from(new Set([...baseIds, ...intersectingElIds]));
+      setSelectedElementIds(combined);
     }
   };
 
   const handleCanvasMouseUp = () => {
+    if (tool === 'select' && isDragging && selectedElementIds.length > 0) {
+      const delta = currentDragDeltaRef.current;
+      if (Math.abs(delta.x) > 0.5 || Math.abs(delta.y) > 0.5) {
+        setLastTransform({
+          type: 'move',
+          dx: delta.x,
+          dy: delta.y,
+        });
+      }
+    }
     setIsDragging(false);
     setIsDrawingDrag(false);
     setSelectedHandle(null);
     setDragImageStartPos(null);
     setDraggedSegment(null);
+    setIsResizing(false);
+    setResizingHandle(null);
+    setResizeStartBox(null);
+    setActiveGuides([]);
+    setIsMiddleClickPanning(false);
+    setSelectionBox(null);
   };
 
   // --- DOUBLE CLICK TO SHARPEN / SMOOTH NODE CONVERSION ---
@@ -1085,6 +1572,7 @@ export default function App() {
   // --- DETECT ELEMENT ENTIRE OUTLINE CLICK FOR SELECTING/TRANSFORMING ---
   const handleElementMouseDown = (e: React.MouseEvent, elementId: string) => {
     e.stopPropagation();
+    e.preventDefault();
 
     const el = getAllElements().find(v => v.id === elementId);
     if (el?.locked) return; // locked elements cannot be interacted with
@@ -1158,19 +1646,68 @@ export default function App() {
     if (tool === 'select') {
       setIsDragging(true);
       setDragStartCanvasPos({ x: e.clientX, y: e.clientY });
+      currentDragDeltaRef.current = { x: 0, y: 0 };
 
       // Save initial positions coordinates to cleanly support drag relative delta
       const currentEls = getAllElements();
-      setDragStartElementsBackup(JSON.parse(JSON.stringify(currentEls)));
 
+      let nextSelectedIds = [...selectedElementIds];
       if (e.shiftKey) {
-        // Multi select
-        setSelectedElementIds(prev =>
-          prev.includes(elementId) ? prev.filter(id => id !== elementId) : [...prev, elementId]
-        );
+        if (nextSelectedIds.includes(elementId)) {
+          nextSelectedIds = nextSelectedIds.filter(id => id !== elementId);
+        } else {
+          nextSelectedIds.push(elementId);
+        }
       } else {
-        // Single select
-        setSelectedElementIds([elementId]);
+        if (!nextSelectedIds.includes(elementId)) {
+          nextSelectedIds = [elementId];
+        }
+      }
+
+      if (e.altKey) {
+        const elsToDuplicate = currentEls.filter(el => nextSelectedIds.includes(el.id));
+        const duplicatedElements = elsToDuplicate.map(el => {
+          const newNodes = el.nodes.map(node => ({
+            ...node,
+            id: `node-${Math.random().toString(36).substr(2, 5)}`,
+            anchor: { ...node.anchor },
+            handleIn: node.handleIn ? { ...node.handleIn } : undefined,
+            handleOut: node.handleOut ? { ...node.handleOut } : undefined,
+          }));
+          return {
+            ...el,
+            id: `el-${Math.random().toString(36).substr(2, 9)}`,
+            name: `${el.name} (Copy)`,
+            nodes: newNodes,
+          };
+        });
+
+        // Add duplicated elements to their layers
+        setLayers(prev =>
+          prev.map(layer => {
+            const layerElIds = layer.elements.map(item => item.id);
+            const dupesForThisLayer = duplicatedElements.filter((_, idx) =>
+              layerElIds.includes(elsToDuplicate[idx].id)
+            );
+            if (dupesForThisLayer.length > 0) {
+              return {
+                ...layer,
+                elements: [...layer.elements, ...dupesForThisLayer],
+              };
+            }
+            return layer;
+          })
+        );
+
+        const newDuplicatedIds = duplicatedElements.map(el => el.id);
+        setSelectedElementIds(newDuplicatedIds);
+
+        // Backup has all elements, including new duplicates, at their starting positions
+        const allElementsWithDupes = [...currentEls, ...duplicatedElements];
+        setDragStartElementsBackup(JSON.parse(JSON.stringify(allElementsWithDupes)));
+      } else {
+        setSelectedElementIds(nextSelectedIds);
+        setDragStartElementsBackup(JSON.parse(JSON.stringify(currentEls)));
       }
       setSelectedNodeInfo(null);
     }
@@ -1291,6 +1828,9 @@ export default function App() {
       } else if (isModKey && (e.key === 'v' || e.key === 'V')) {
         e.preventDefault();
         handlePaste();
+      } else if (isModKey && (e.key === 'd' || e.key === 'D')) {
+        e.preventDefault();
+        handleRepeatTransform();
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedNodeInfo && tool === 'direct-select') {
           // Delete selected node
@@ -1329,9 +1869,21 @@ export default function App() {
       } else if (e.key === 'p' || e.key === 'P') {
         e.preventDefault();
         activatePenTool();
-      } else if (e.key === 's' || e.key === 'S' || e.key === 'a' || e.key === 'A') {
+      } else if (e.key === 'a' || e.key === 'A') {
         e.preventDefault();
         setTool('direct-select');
+      } else if (e.key === 's' || e.key === 'S') {
+        e.preventDefault();
+        setTool('spiral');
+      } else if (e.key === 't' || e.key === 'T') {
+        e.preventDefault();
+        setTool('triangle');
+      } else if (e.key === 'r' || e.key === 'R') {
+        e.preventDefault();
+        setTool('rect');
+      } else if (e.key === 'e' || e.key === 'E') {
+        e.preventDefault();
+        setTool('ellipse');
       } else if (e.key === 'v' || e.key === 'V') {
         e.preventDefault();
         setTool('select');
@@ -1340,7 +1892,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedElementIds, selectedNodeInfo, activePathId, tool, copiedElements, layers, activeLayerId]);
+  }, [selectedElementIds, selectedNodeInfo, activePathId, tool, copiedElements, layers, activeLayerId, lastTransform]);
 
   // --- MOUSE WHEEL ZOOM ON CANVAS ---
   useEffect(() => {
@@ -1495,64 +2047,28 @@ export default function App() {
   const activeSelectedElement = selectedElements[0] || null;
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-slate-900 font-sans text-neutral-100 overflow-hidden">
+    <div className="flex flex-col h-screen w-screen bg-slate-50/60 font-sans text-slate-900 overflow-hidden">
       {/* --- Top Navbar --- */}
-      <header className="flex items-center justify-between px-6 py-4 bg-slate-950 border-b border-slate-800 shadow-md">
+      <header className="flex items-center justify-between px-6 py-4 bg-white border-b border-slate-200/80 shadow-sm">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-gradient-to-tr from-rose-600 to-amber-500 rounded-lg text-white font-bold leading-none">
+          <div className="p-2 bg-blue-50 text-blue-600 border border-blue-100 rounded-lg font-bold leading-none">
             <Sparkles size={22} />
           </div>
           <div>
-            <h1 className="text-xl font-semibold tracking-tight text-white flex items-center gap-2">
-              Vector Craft Studio
-              <span className="text-xs font-normal px-2 py-0.5 rounded-full bg-slate-900 border border-slate-800 text-indigo-400">
-                Precision Design
-              </span>
+            <h1 className="text-xl font-bold tracking-tight text-slate-900 flex items-center gap-2">
+              Kāpiti Libraries Vector Design
             </h1>
-            <p className="text-xs text-slate-400">Illustrator-style Pen Tool, Bezier Node Editor & Tracing studio.</p>
+            <p className="text-xs text-slate-500">Illustrator-style Pen Tool, Bezier Node Editor & Tracing studio.</p>
           </div>
         </div>
 
         <div className="flex items-center gap-3">
-          {/* Preset Templates Fast Dropdown */}
-          <div className="relative group">
-            <button className="flex items-center gap-1.5 px-4 py-2 bg-slate-800 hover:bg-slate-700 active:bg-slate-750 text-emerald-400 font-medium text-xs rounded-lg border border-slate-700 transition">
-              <Plus size={14} />
-              Insert Vector Presets
-            </button>
-            <div className="absolute right-0 top-full mt-1.5 w-60 bg-slate-800 border border-slate-700 rounded-lg shadow-xl py-2 hidden group-hover:block hover:block z-50">
-              <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-400 border-b border-slate-700 uppercase tracking-wider">
-                Vector Presets & Curves
-              </div>
-              <button
-                onClick={() => handleLoadTemplate('spiral')}
-                className="w-full text-left px-4 py-2.5 text-xs hover:bg-slate-700 text-white flex items-center justify-between"
-              >
-                <span>🌀 Spiral Flourish Shape</span>
-                <span className="text-[10px] text-rose-400 bg-rose-950/40 px-1.5 py-0.5 rounded border border-rose-900">Complex</span>
-              </button>
-              <button
-                onClick={() => handleLoadTemplate('teardrop')}
-                className="w-full text-left px-4 py-2.5 text-xs hover:bg-slate-700 text-white flex items-center justify-between"
-              >
-                <span>💧 Fluid Teardrop</span>
-                <span className="text-[10px] text-amber-400 bg-amber-950/40 px-1.5 py-0.5 rounded border border-amber-900">Smooth</span>
-              </button>
-              <button
-                onClick={() => handleLoadTemplate('leaf')}
-                className="w-full text-left px-4 py-2.5 text-xs hover:bg-slate-700 text-white flex items-center justify-between"
-              >
-                <span>🌿 Mirrored Leaf Duo</span>
-                <span className="text-[10px] text-teal-400 bg-teal-950/40 px-1.5 py-0.5 rounded border border-teal-900">Symmetric</span>
-              </button>
-            </div>
-          </div>
 
           <button
             onClick={() => {
               if (fileInputRef.current) fileInputRef.current.click();
             }}
-            className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-white font-medium text-xs transition"
+            className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white font-semibold text-xs transition shadow-sm"
           >
             <ImageIcon size={14} />
             Import Trace Image
@@ -1567,7 +2083,7 @@ export default function App() {
 
           <button
             onClick={handleExportProject}
-            className="flex items-center gap-1.5 px-3.5 py-2 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-700/80 text-indigo-300 hover:text-indigo-100 rounded-lg font-medium text-xs transition shadow-md cursor-pointer"
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 hover:text-slate-900 rounded-lg font-semibold text-xs transition shadow-sm cursor-pointer"
             title="Save working project file (.json) to resume later"
           >
             <Save size={14} />
@@ -1578,7 +2094,7 @@ export default function App() {
             onClick={() => {
               if (projectFileInputRef.current) projectFileInputRef.current.click();
             }}
-            className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-900 hover:bg-slate-850 border border-slate-700 text-slate-300 hover:text-white rounded-lg font-medium text-xs transition shadow-md cursor-pointer"
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 hover:text-slate-900 rounded-lg font-semibold text-xs transition shadow-sm cursor-pointer"
             title="Open/Upload a previously saved working project file (.json)"
           >
             <FolderOpen size={14} />
@@ -1592,11 +2108,11 @@ export default function App() {
             className="hidden"
           />
 
-          <div className="h-6 w-[1px] bg-slate-800 my-auto mx-1"></div>
+          <div className="h-6 w-[1px] bg-slate-200 my-auto mx-1"></div>
 
           <button
             onClick={handleExportSVG}
-            className="flex items-center gap-1.5 px-4 py-2 bg-rose-600 hover:bg-rose-500 rounded-lg text-white font-medium text-xs transition shadow-md"
+            className="flex items-center gap-1.5 px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-white font-semibold text-xs transition shadow-sm"
             title="Download vector as pristine .svg"
           >
             <Download size={14} />
@@ -1605,7 +2121,7 @@ export default function App() {
 
           <button
             onClick={handleExportDXF}
-            className="flex items-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-white font-medium text-xs transition shadow-md"
+            className="flex items-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded-lg text-white font-semibold text-xs transition shadow-sm"
             title="Download vector as CAD-compatible .dxf"
           >
             <Download size={14} />
@@ -1614,7 +2130,7 @@ export default function App() {
 
           <button
             onClick={() => setShowHelp(prev => !prev)}
-            className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-300 hover:text-white transition"
+            className="p-2 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-slate-600 hover:text-slate-900 transition shadow-sm"
             title="Ngā Tohutohu - Help Dialog"
           >
             <HelpCircle size={18} />
@@ -1627,34 +2143,34 @@ export default function App() {
         
         {/* --- Quick Floating Welcome Banner / Guide --- */}
         {showHelp && (
-          <div className="absolute top-4 left-4 right-4 md:left-20 md:right-auto md:w-96 bg-slate-950/95 border-l-4 border-rose-500 border border-slate-800 p-4 rounded-r-xl shadow-2xl z-40 transition-all text-xs">
+          <div className="absolute top-4 left-4 right-4 md:left-20 md:right-auto md:w-96 bg-white/95 border-l-4 border-red-600 border border-slate-200 p-4 rounded-r-xl shadow-2xl z-40 transition-all text-xs text-slate-700">
             <div className="flex justify-between items-start mb-2">
-              <h4 className="font-bold text-white uppercase tracking-wider flex items-center gap-1">
-                <Sparkles size={14} className="text-rose-500 animate-pulse" />
+              <h4 className="font-bold text-slate-900 uppercase tracking-wider flex items-center gap-1">
+                <Sparkles size={14} className="text-red-600 animate-pulse" />
                 Vector Tracing & Drawing Guide
               </h4>
               <button
                 onClick={() => setShowHelp(false)}
-                className="text-slate-400 hover:text-white font-bold px-1.5 py-0.5 rounded bg-slate-800 text-[10px]"
+                className="text-slate-500 hover:text-slate-800 font-bold px-1.5 py-0.5 rounded bg-slate-100 text-[10px]"
               >
                 ✕ Hide
               </button>
             </div>
-            <p className="text-slate-300 mb-2 leading-relaxed">
+            <p className="text-slate-600 mb-2 leading-relaxed">
               Design elegant curves, trace reference shapes, and combine overlapping layouts using our professional vector utilities:
             </p>
-            <ul className="space-y-1 text-slate-400 list-disc list-inside">
-              <li><strong className="text-slate-200">Pen Tool</strong>: Click to place nodes, <strong className="text-rose-400">click & drag</strong> to stretch smooth handles. Click the first node to close the path!</li>
-              <li><strong className="text-slate-200">Direct Select</strong>: Double-click nodes to <strong className="text-emerald-400">sharpen corner</strong> joints immediately! Drag anchors or handles to warp curves.</li>
-              <li><strong className="text-slate-200">Pathfinder Operations</strong>: Overlap shapes, select both, and click Union or Subtract to carve unique vectors.</li>
-              <li><span className="text-slate-200 font-semibold">Tracing Background</span>: Drop any PNG, JPG, or SVG reference onto the canvas to draw over with precision.</li>
+            <ul className="space-y-1 text-slate-500 list-disc list-inside">
+              <li><strong className="text-slate-800">Pen Tool</strong>: Click to place nodes, <strong className="text-red-600">click & drag</strong> to stretch smooth handles. Click the first node to close the path!</li>
+              <li><strong className="text-slate-800">Direct Select</strong>: Double-click nodes to <strong className="text-emerald-600">sharpen corner</strong> joints immediately! Drag anchors or handles to warp curves.</li>
+              <li><strong className="text-slate-800">Pathfinder Operations</strong>: Overlap shapes, select both, and click Union or Subtract to carve unique vectors.</li>
+              <li><span className="text-slate-800 font-semibold">Tracing Background</span>: Drop any PNG, JPG, or SVG reference onto the canvas to draw over with precision.</li>
             </ul>
           </div>
         )}
 
         {/* --- Left Tool Rail (Drawing Tools) --- */}
-        <div className="w-16 bg-slate-950 border-r border-slate-800 flex flex-col items-center py-4 gap-2 z-30 select-none">
-          <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-2">Tools</div>
+        <div className="w-16 bg-white border-r border-slate-200/80 flex flex-col items-center py-4 gap-2 z-30 select-none">
+          <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-2">Tools</div>
 
           <button
             onClick={() => {
@@ -1662,13 +2178,13 @@ export default function App() {
               setSelectedNodeInfo(null);
             }}
             className={`p-3 rounded-lg transition relative group ${
-              tool === 'select' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+              tool === 'select' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
             }`}
-            title="Transform/Move Tool (Pointer)"
+            title="Selection/Move Tool (V)"
           >
             <Pointer size={18} />
-            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-950 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
-              Mānuka Select (pointer)
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              Selection Tool (V)
             </span>
           </button>
 
@@ -1677,13 +2193,13 @@ export default function App() {
               setTool('direct-select');
             }}
             className={`p-3 rounded-lg transition relative group ${
-              tool === 'direct-select' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+              tool === 'direct-select' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
             }`}
-            title="Direct Node Select Tool (S)"
+            title="Direct Node Select Tool (A)"
           >
             <MousePointerSquareDashed size={18} />
-            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-950 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
-              Node Editor (handles)
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              Node Editor (handles) (A)
             </span>
           </button>
 
@@ -1692,27 +2208,27 @@ export default function App() {
               activatePenTool();
             }}
             className={`p-3 rounded-lg transition relative group ${
-              tool === 'pen' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+              tool === 'pen' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
             }`}
             title="Pen Curve Tool (P)"
           >
             <PenTool size={18} />
-            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-950 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
-              bezier Pen Tool
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              bezier Pen Tool (P)
             </span>
           </button>
 
-          <div className="w-8 h-[1px] bg-slate-800 my-2"></div>
+          <div className="w-8 h-[1px] bg-slate-200 my-2"></div>
 
           <button
             onClick={() => setTool('rect')}
             className={`p-3 rounded-lg transition relative group ${
-              tool === 'rect' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+              tool === 'rect' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
             }`}
-            title="Rectangle Tool"
+            title="Rectangle Tool (R)"
           >
             <Square size={18} />
-            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-950 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
               Rectangle (R)
             </span>
           </button>
@@ -1720,25 +2236,38 @@ export default function App() {
           <button
             onClick={() => setTool('ellipse')}
             className={`p-3 rounded-lg transition relative group ${
-              tool === 'ellipse' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+              tool === 'ellipse' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
             }`}
-            title="Ellipse Tool"
+            title="Ellipse Tool (E)"
           >
             <Circle size={18} />
-            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-950 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
               Ellipse (E)
+            </span>
+          </button>
+
+          <button
+            onClick={() => setTool('triangle')}
+            className={`p-3 rounded-lg transition relative group ${
+              tool === 'triangle' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
+            }`}
+            title="Triangle Tool (T)"
+          >
+            <Triangle size={18} />
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              Triangle (T)
             </span>
           </button>
 
           <button
             onClick={() => setTool('spiral')}
             className={`p-3 rounded-lg transition relative group ${
-              tool === 'spiral' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+              tool === 'spiral' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
             }`}
-            title="Spiral Stamp Tool"
+            title="Spiral Stamp Tool (S)"
           >
-            <Compass size={18} className="text-rose-400 rotate-45" />
-            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-950 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+            <Compass size={18} className="text-red-500 rotate-45" />
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
               Spiral Stamp Tool (S)
             </span>
           </button>
@@ -1746,12 +2275,12 @@ export default function App() {
           <button
             onClick={() => setTool('eraser')}
             className={`p-3 rounded-lg transition relative group ${
-              tool === 'eraser' ? 'bg-rose-600 text-white font-bold' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+              tool === 'eraser' ? 'bg-red-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
             }`}
             title="Eraser / Delete Asset"
           >
             <Trash2 size={18} />
-            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-950 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
               Eraser / Delete (E)
             </span>
           </button>
@@ -1759,26 +2288,26 @@ export default function App() {
           <div className="flex-1"></div>
 
           {/* Canvas Controls */}
-          <div className="w-8 h-[1px] bg-slate-800 my-2"></div>
+          <div className="w-8 h-[1px] bg-slate-200 my-2"></div>
 
           <div className="flex flex-col items-center gap-1">
             <button
               onClick={() => setGrid(g => ({ ...g, visible: !g.visible }))}
-              className={`p-2 rounded transition ${grid.visible ? 'text-indigo-400' : 'text-slate-600'}`}
+              className={`p-2 rounded transition ${grid.visible ? 'text-blue-600 bg-blue-50 border border-blue-100 shadow-sm' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Toggle Grid Lines"
             >
               <Grid size={16} />
             </button>
             <button
               onClick={() => setGrid(g => ({ ...g, snap: !g.snap }))}
-              className={`p-2 rounded transition ${grid.snap ? 'text-indigo-400 bg-slate-900 border border-slate-700' : 'text-slate-600'}`}
+              className={`p-2 rounded transition ${grid.snap ? 'text-blue-600 bg-blue-50 border border-blue-100 shadow-sm' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Toggle Grid Snapping"
             >
               <Maximize2 size={14} className={grid.snap ? 'animate-pulse' : ''} />
             </button>
             <button
               onClick={() => setSnapToPoints(s => !s)}
-              className={`p-2 rounded transition ${snapToPoints ? 'text-rose-400 bg-slate-900 border border-slate-700' : 'text-slate-600'}`}
+              className={`p-2 rounded transition ${snapToPoints ? 'text-red-600 bg-red-50 border border-red-100 shadow-sm' : 'text-slate-400 hover:bg-slate-50'}`}
               title="Snap to Node Anchors"
             >
               <Compass size={14} />
@@ -1789,19 +2318,19 @@ export default function App() {
         {/* --- Main Art Canvas Stage --- */}
         <div
           ref={canvasContainerRef}
-          className="flex-1 bg-slate-900 relative overflow-hidden select-none"
+          className="flex-1 bg-slate-50/60 relative overflow-hidden select-none"
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
         >
           {/* Centered ruler markings (Left / Top edges) */}
-          <div className="absolute top-0 left-0 right-0 h-4 bg-slate-950/80 border-b border-slate-800 text-[9px] text-slate-500 px-8 flex justify-between select-none z-10 font-mono">
+          <div className="absolute top-0 left-0 right-0 h-4 bg-white border-b border-slate-200/80 text-[9px] text-slate-400 px-8 flex justify-between select-none z-10 font-mono">
             <span>0px</span>
             <span>200px</span>
             <span>400px</span>
             <span>600px</span>
             <span>800px</span>
           </div>
-          <div className="absolute top-4 left-0 bottom-0 w-4 bg-slate-950/80 border-r border-slate-800 text-[9px] text-slate-500 py-8 flex flex-col justify-between items-center select-none z-10 font-mono">
+          <div className="absolute top-4 left-0 bottom-0 w-4 bg-white border-r border-slate-200/80 text-[9px] text-slate-400 py-8 flex flex-col justify-between items-center select-none z-10 font-mono">
             <span>0px</span>
             <span>200px</span>
             <span>400px</span>
@@ -1810,10 +2339,10 @@ export default function App() {
 
           {/* Outer Canvas Overlay Drag-over */}
           {isDragOverCanvas && (
-            <div className="absolute inset-0 bg-indigo-900/60 border-4 border-dashed border-indigo-400 flex flex-col items-center justify-center z-50 text-white">
-              <FileImage size={48} className="animate-bounce text-indigo-200 mb-2" />
+            <div className="absolute inset-0 bg-blue-900/40 border-4 border-dashed border-blue-400 flex flex-col items-center justify-center z-50 text-white">
+              <FileImage size={48} className="animate-bounce text-blue-100 mb-2" />
               <p className="font-bold text-lg">Drop your image here to load reference tracing layer</p>
-              <p className="text-xs text-indigo-200 mt-1">Accepts PNG, JPG, or SVG drawings</p>
+              <p className="text-xs text-blue-100 mt-1">Accepts PNG, JPG, or SVG drawings</p>
             </div>
           )}
 
@@ -1826,7 +2355,13 @@ export default function App() {
             onMouseMove={handleCanvasMouseMove}
             onMouseUp={handleCanvasMouseUp}
             onDrop={handleDrop}
-            className="absolute inset-0 cursor-crosshair"
+            className={`absolute inset-0 ${
+              isMiddleClickPanning
+                ? 'cursor-grabbing'
+                : tool === 'select'
+                ? 'cursor-default'
+                : 'cursor-crosshair'
+            }`}
           >
             <defs>
               {/* Pattern definition for grid lines */}
@@ -1839,7 +2374,7 @@ export default function App() {
                 <path
                   d={`M ${grid.size} 0 L 0 0 0 ${grid.size}`}
                   fill="none"
-                  stroke="#1e293b"
+                  stroke="#e2e8f0"
                   strokeWidth="1"
                 />
               </pattern>
@@ -1861,8 +2396,8 @@ export default function App() {
               )}
 
               {/* Center Axis Reference */}
-              <line x1="-1000" y1="300" x2="2000" y2="300" stroke="#334155" strokeWidth="0.5" strokeDasharray="4 4" className="pointer-events-none" />
-              <line x1="400" y1="-1000" x2="400" y2="2000" stroke="#334155" strokeWidth="0.5" strokeDasharray="4 4" className="pointer-events-none" />
+              <line x1="-1000" y1="300" x2="2000" y2="300" stroke="#cbd5e1" strokeWidth="0.5" strokeDasharray="4 4" className="pointer-events-none" />
+              <line x1="400" y1="-1000" x2="400" y2="2000" stroke="#cbd5e1" strokeWidth="0.5" strokeDasharray="4 4" className="pointer-events-none" />
 
               {/* 2. Tracing Image layer */}
               {tracingImage && tracingImage.visible && (
@@ -1892,7 +2427,7 @@ export default function App() {
                       width={500 * tracingImage.scale}
                       height={350 * tracingImage.scale}
                       fill="none"
-                      stroke="#4f46e5"
+                      stroke="#2563eb"
                       strokeWidth="2"
                       strokeDasharray="4"
                       className="pointer-events-none"
@@ -1919,7 +2454,7 @@ export default function App() {
                             d={d}
                             fill={el.fill}
                             fillOpacity={el.fill === 'none' ? 0 : el.fillOpacity}
-                            stroke={isSelected ? '#4f46e5' : el.stroke}
+                            stroke={isSelected ? '#2563eb' : el.stroke}
                             strokeWidth={isSelected ? el.strokeWidth + 1.5 : el.strokeWidth}
                             strokeLinecap="round"
                             strokeLinejoin="round"
@@ -1933,7 +2468,7 @@ export default function App() {
                             <path
                               d={d}
                               fill="none"
-                              stroke="#6366f1"
+                              stroke="#2563eb"
                               strokeWidth="1"
                               strokeDasharray="4 4"
                               className="pointer-events-none"
@@ -1970,6 +2505,103 @@ export default function App() {
                   </g>
                 );
               })}
+
+              {/* Alignment Guides (Smart Guides) */}
+              {activeGuides.map((guide, idx) => {
+                if (guide.type === 'vertical') {
+                  return (
+                    <line
+                      key={`guide-v-${idx}`}
+                      x1={guide.coord}
+                      y1={guide.minVal - 100}
+                      x2={guide.coord}
+                      y2={guide.maxVal + 100}
+                      stroke="#ff00ff"
+                      strokeWidth={1.5 / zoom}
+                      strokeDasharray="4 4"
+                      className="pointer-events-none"
+                    />
+                  );
+                } else {
+                  return (
+                    <line
+                      key={`guide-h-${idx}`}
+                      x1={guide.minVal - 100}
+                      y1={guide.coord}
+                      x2={guide.maxVal + 100}
+                      y2={guide.coord}
+                      stroke="#ff00ff"
+                      strokeWidth={1.5 / zoom}
+                      strokeDasharray="4 4"
+                      className="pointer-events-none"
+                    />
+                  );
+                }
+              })}
+
+              {/* Combined Selection Bounding Box and Resize Handles */}
+              {(() => {
+                if (tool !== 'select' || selectedElementIds.length === 0) return null;
+                const selectedEls = getAllElements().filter(el => selectedElementIds.includes(el.id));
+                if (selectedEls.length === 0) return null;
+
+                const box = getCombinedBoundingBox(selectedEls);
+                const strokeW = 1.5 / zoom;
+                const handleSize = 8 / zoom;
+                const halfSize = handleSize / 2;
+
+                const handles = [
+                  { id: 'nw', x: box.minX, y: box.minY, cursor: 'nwse-resize' },
+                  { id: 'n', x: box.centerX, y: box.minY, cursor: 'ns-resize' },
+                  { id: 'ne', x: box.maxX, y: box.minY, cursor: 'nesw-resize' },
+                  { id: 'e', x: box.maxX, y: box.centerY, cursor: 'ew-resize' },
+                  { id: 'se', x: box.maxX, y: box.maxY, cursor: 'nwse-resize' },
+                  { id: 's', x: box.centerX, y: box.maxY, cursor: 'ns-resize' },
+                  { id: 'sw', x: box.minX, y: box.maxY, cursor: 'nesw-resize' },
+                  { id: 'w', x: box.minX, y: box.centerY, cursor: 'ew-resize' },
+                ];
+
+                return (
+                  <g>
+                    {/* Bounding box rect */}
+                    <rect
+                      x={box.minX}
+                      y={box.minY}
+                      width={box.width}
+                      height={box.height}
+                      fill="none"
+                      stroke="#6366f1"
+                      strokeWidth={strokeW}
+                      strokeDasharray={`${4 / zoom} ${4 / zoom}`}
+                      className="pointer-events-none"
+                    />
+
+                    {/* 8 resize handles */}
+                    {handles.map(h => (
+                      <rect
+                        key={h.id}
+                        x={h.x - halfSize}
+                        y={h.y - halfSize}
+                        width={handleSize}
+                        height={handleSize}
+                        fill="#ffffff"
+                        stroke="#4f46e5"
+                        strokeWidth={1.5 / zoom}
+                        style={{ cursor: h.cursor }}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          setIsResizing(true);
+                          setResizingHandle(h.id);
+                          setResizeStartBox({ ...box });
+                          setDragStartCanvasPos({ x: e.clientX, y: e.clientY });
+                          setDragStartElementsBackup(JSON.parse(JSON.stringify(getAllElements())));
+                        }}
+                      />
+                    ))}
+                  </g>
+                );
+              })()}
 
               {/* 4. ACTIVE DRAWING PEN LIVE PREVIEW GUIDE */}
               {tool === 'pen' && activePathId && penPreviewPos && (
@@ -2017,7 +2649,7 @@ export default function App() {
                                 y1={node.anchor.y}
                                 x2={node.handleIn.x}
                                 y2={node.handleIn.y}
-                                stroke="#f43f5e"
+                                stroke="#dc2626"
                                 strokeWidth="1.5"
                               />
                               <circle
@@ -2025,7 +2657,7 @@ export default function App() {
                                 cy={node.handleIn.y}
                                 r="4"
                                 fill="#fff"
-                                stroke="#f43f5e"
+                                stroke="#dc2626"
                                 strokeWidth="2"
                                 style={{ cursor: 'pointer' }}
                                 onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'handleIn')}
@@ -2037,22 +2669,22 @@ export default function App() {
                           {node.handleOut && (
                             <g>
                               <line
-                                x1={node.anchor.x}
-                                y1={node.anchor.y}
-                                x2={node.handleOut.x}
-                                y2={node.handleOut.y}
-                                stroke="#3b82f6"
-                                strokeWidth="1.5"
+                                 x1={node.anchor.x}
+                                 y1={node.anchor.y}
+                                 x2={node.handleOut.x}
+                                 y2={node.handleOut.y}
+                                 stroke="#2563eb"
+                                 strokeWidth="1.5"
                               />
                               <circle
-                                cx={node.handleOut.x}
-                                cy={node.handleOut.y}
-                                r="4"
-                                fill="#fff"
-                                stroke="#3b82f6"
-                                strokeWidth="2"
-                                style={{ cursor: 'pointer' }}
-                                onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'handleOut')}
+                                 cx={node.handleOut.x}
+                                 cy={node.handleOut.y}
+                                 r="4"
+                                 fill="#fff"
+                                 stroke="#2563eb"
+                                 strokeWidth="2"
+                                 style={{ cursor: 'pointer' }}
+                                 onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'handleOut')}
                               />
                             </g>
                           )}
@@ -2064,8 +2696,8 @@ export default function App() {
                             width="10"
                             height="10"
                             rx="1.5"
-                            fill={isNodeSelected ? '#e11d48' : '#fff'}
-                            stroke={isNodeSelected ? '#f43f5e' : '#4f46e5'}
+                            fill={isNodeSelected ? '#dc2626' : '#fff'}
+                            stroke={isNodeSelected ? '#dc2626' : '#2563eb'}
                             strokeWidth="2.5"
                             style={{ cursor: 'pointer' }}
                             onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'anchor')}
@@ -2081,59 +2713,74 @@ export default function App() {
                   });
                 })
               )}
+
+              {/* Selection Marquee Box */}
+              {selectionBox && (
+                <rect
+                  x={Math.min(selectionBox.start.x, selectionBox.current.x)}
+                  y={Math.min(selectionBox.start.y, selectionBox.current.y)}
+                  width={Math.abs(selectionBox.start.x - selectionBox.current.x)}
+                  height={Math.abs(selectionBox.start.y - selectionBox.current.y)}
+                  fill="rgba(37, 99, 235, 0.08)"
+                  stroke="#2563eb"
+                  strokeWidth={1.5 / zoom}
+                  strokeDasharray="4 4"
+                  className="pointer-events-none"
+                />
+              )}
             </g>
           </svg>
 
           {/* Quick Zoom / Pan HUD controller overlay */}
-          <div className="absolute bottom-4 left-4 bg-slate-950/95 border border-slate-800 rounded-lg p-2 flex items-center gap-3 z-30 shadow-lg text-xs">
-            <div className="font-mono text-slate-400">Zoom: {Math.round(zoom * 100)}%</div>
+          <div className="absolute bottom-4 left-4 bg-white/95 border border-slate-200/80 rounded-lg p-2 flex items-center gap-3 z-30 shadow-lg text-xs">
+            <div className="font-mono text-slate-500">Zoom: {Math.round(zoom * 100)}%</div>
             <div className="flex gap-1">
               <button
                 onClick={() => setZoom(z => Math.max(0.2, z - 0.15))}
-                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-white"
+                className="px-2 py-1 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded transition font-semibold"
               >
                 -
               </button>
               <button
                 onClick={() => setZoom(1)}
-                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-300"
+                className="px-2 py-1 bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 rounded transition font-semibold"
               >
                 Reset
               </button>
               <button
                 onClick={() => setZoom(z => Math.min(4, z + 0.15))}
-                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 rounded text-white"
+                className="px-2 py-1 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded transition font-semibold"
               >
                 +
               </button>
             </div>
-            <div className="w-[1px] h-4 bg-slate-800"></div>
+            <div className="w-[1px] h-4 bg-slate-200"></div>
             <button
               onClick={() => {
                 setPanOffset({ x: 100, y: 50 });
                 setZoom(1);
               }}
-              className="px-2 py-1 bg-slate-850 hover:bg-slate-750 text-slate-400 hover:text-white rounded flex items-center gap-1 text-[11px]"
+              className="px-2 py-1 bg-white hover:bg-slate-50 border border-slate-200 text-slate-600 hover:text-slate-900 rounded flex items-center gap-1 text-[11px] transition font-semibold"
               title="Reset view camera position to center"
             >
               <RotateCcw size={12} /> Re-center
             </button>
-            <div className="text-[10px] text-slate-500 hidden md:inline ml-2">Drag workspace: Hold left-click on blank background</div>
+            <div className="text-[10px] text-slate-400 hidden md:inline ml-2">Drag workspace: Hold left-click on blank background</div>
           </div>
         </div>
-
+ 
         {/* --- Right Inspector Panel (Properties, Pathfinder & Layers) --- */}
-        <aside className="w-80 bg-slate-950 border-l border-slate-800 flex flex-col z-30 select-none overflow-y-auto max-h-[100%]">
+        <aside className="w-80 bg-white border-l border-slate-200/80 flex flex-col z-30 select-none overflow-y-auto max-h-[100%]">
           
           {/* Section: Properties fill and stroke */}
-          <div className="p-4 border-b border-slate-800">
-            <h3 className="text-xs font-bold uppercase text-slate-400 tracking-wider mb-3">Properties</h3>
+          <div className="p-4 border-b border-slate-200/80">
+            <h3 className="text-xs font-bold uppercase text-slate-500 tracking-wider mb-3">Properties</h3>
             
             <div className="space-y-4">
               
               {/* Designer Fill Swatch Selectors */}
               <div>
-                <label className="block text-[11px] text-slate-400 mb-1.5 font-medium">Fill Color</label>
+                <label className="block text-[11px] text-slate-500 mb-1.5 font-semibold">Fill Color</label>
                 <div className="grid grid-cols-4 gap-1.5 font-sans">
                   {ART_PALETTE.map((color) => (
                     <button
@@ -2143,7 +2790,7 @@ export default function App() {
                         updateSelectedElementsProperty('fill', color.value);
                       }}
                       className={`h-7 rounded border relative transition flex items-center justify-center ${
-                        fillColor === color.value ? 'border-indigo-500 ring-2 ring-indigo-900/60' : 'border-slate-800 hover:border-slate-600'
+                        fillColor === color.value ? 'border-blue-500 ring-2 ring-blue-100' : 'border-slate-200 hover:border-slate-400'
                       }`}
                       style={{
                         backgroundColor: color.value === 'none' ? 'transparent' : color.value,
@@ -2164,7 +2811,7 @@ export default function App() {
               {/* Opacity slider */}
               {fillColor !== 'none' && (
                 <div>
-                  <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                  <div className="flex justify-between text-[11px] text-slate-500 font-semibold mb-1">
                     <span>Opacity</span>
                     <span>{Math.round(fillOpacity * 100)}%</span>
                   </div>
@@ -2179,7 +2826,7 @@ export default function App() {
                       setFillOpacity(val);
                       updateSelectedElementsProperty('fillOpacity', val);
                     }}
-                    className="w-full accent-indigo-500 h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer"
+                    className="w-full accent-blue-600 h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer"
                   />
                 </div>
               )}
@@ -2187,7 +2834,7 @@ export default function App() {
               {/* Stroke controls */}
               <div className="grid grid-cols-2 gap-3 pt-2">
                 <div>
-                  <label className="block text-[11px] text-slate-400 mb-1 font-medium">Stroke Color</label>
+                  <label className="block text-[11px] text-slate-500 mb-1 font-semibold">Stroke Color</label>
                   <div className="flex gap-1.5">
                     <input
                       type="color"
@@ -2196,14 +2843,14 @@ export default function App() {
                         setStrokeColor(e.target.value);
                         updateSelectedElementsProperty('stroke', e.target.value);
                       }}
-                      className="w-8 h-8 rounded border border-slate-700 bg-transparent cursor-pointer"
+                      className="w-8 h-8 rounded border border-slate-200 bg-transparent cursor-pointer"
                     />
-                    <div className="text-[10px] text-slate-400 self-center font-mono">{strokeColor}</div>
+                    <div className="text-[10px] text-slate-500 self-center font-mono">{strokeColor}</div>
                   </div>
                 </div>
 
                 <div>
-                  <label className="block text-[11px] text-slate-400 mb-1 font-medium">Stroke Width</label>
+                  <label className="block text-[11px] text-slate-500 mb-1 font-semibold">Stroke Width</label>
                   <input
                     type="number"
                     min="1"
@@ -2214,30 +2861,30 @@ export default function App() {
                       setStrokeWidth(val);
                       updateSelectedElementsProperty('strokeWidth', val);
                     }}
-                    className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white font-mono"
+                    className="w-full bg-white border border-slate-200 rounded px-2 py-1 text-xs text-slate-800 font-mono focus:border-blue-500 focus:outline-none"
                   />
                 </div>
               </div>
 
               {/* Active element closure toggle */}
               {activeSelectedElement && (
-                <div className="flex items-center justify-between bg-slate-900/60 p-2.5 rounded-lg border border-slate-800 text-[11px]">
-                  <span className="text-slate-300 font-medium">Close Vector Path Loop</span>
+                <div className="flex items-center justify-between bg-slate-50/60 p-2.5 rounded-lg border border-slate-200/80 text-[11px]">
+                  <span className="text-slate-700 font-semibold">Close Vector Path Loop</span>
                   <input
                     type="checkbox"
                     checked={activeSelectedElement.closed}
                     onChange={(e) => {
                       updateSelectedElementsProperty('closed', e.target.checked);
                     }}
-                    className="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500 bg-slate-800 border-slate-700"
+                    className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 bg-white border-slate-200"
                   />
                 </div>
               )}
 
               {/* Anchor Type Editor (Corner, Symmetric, Smooth) */}
               {tool === 'direct-select' && selectedNodeInfo && getSelectedNode() && (
-                <div className="bg-slate-900/60 p-3 rounded-lg border border-slate-850 space-y-2">
-                  <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Selected Node Anchor Type</div>
+                <div className="bg-slate-50/60 p-3 rounded-lg border border-slate-200/80 space-y-2">
+                  <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wide">Selected Node Anchor Type</div>
                   <div className="grid grid-cols-3 gap-1">
                     {(['corner', 'smooth', 'symmetric'] as NodeType[]).map((t) => {
                       const currNode = getSelectedNode();
@@ -2246,8 +2893,8 @@ export default function App() {
                         <button
                           key={t}
                           onClick={() => updateSelectedNodeProperty('type', t)}
-                          className={`py-1 rounded text-[10px] font-medium capitalize transition ${
-                            isActive ? 'bg-rose-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-750'
+                          className={`py-1 rounded text-[10px] font-semibold capitalize transition ${
+                            isActive ? 'bg-red-600 text-white shadow-sm' : 'bg-white text-slate-600 hover:bg-slate-50 border border-slate-200'
                           }`}
                         >
                           {t}
@@ -2255,7 +2902,7 @@ export default function App() {
                       );
                     })}
                   </div>
-                  <p className="text-[10px] text-slate-400 leading-tight">
+                  <p className="text-[10px] text-slate-500 leading-tight">
                     * Smooth / Symmetric automatically balance control points symmetrically over the anchor node.
                   </p>
                 </div>
@@ -2265,8 +2912,8 @@ export default function App() {
           </div>
 
           {/* Section: Clipboard Actions */}
-          <div className="p-4 border-b border-slate-800 bg-slate-950/40">
-            <h3 className="text-xs font-bold uppercase text-indigo-400 tracking-wider mb-2.5 flex items-center gap-1.5">
+          <div className="p-4 border-b border-slate-200/80 bg-slate-50/40">
+            <h3 className="text-xs font-bold uppercase text-blue-600 tracking-wider mb-2.5 flex items-center gap-1.5">
               <span>📋 Clipboard Actions</span>
             </h3>
             <div className="grid grid-cols-2 gap-2 mb-2">
@@ -2275,8 +2922,8 @@ export default function App() {
                 disabled={selectedElementIds.length === 0}
                 className={`py-2 px-3 rounded border text-xs text-center font-semibold transition flex items-center justify-center gap-1 cursor-pointer ${
                   selectedElementIds.length > 0
-                    ? 'bg-slate-850 hover:bg-slate-800 border-slate-700 text-slate-100'
-                    : 'bg-slate-950/50 border-slate-900 text-slate-600 cursor-not-allowed'
+                    ? 'bg-white hover:bg-slate-50 border-slate-200 text-slate-700 shadow-sm'
+                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed'
                 }`}
                 title="Copy selected elements to clipboard (Ctrl+C)"
               >
@@ -2287,64 +2934,118 @@ export default function App() {
                 disabled={copiedElements.length === 0}
                 className={`py-2 px-3 rounded border text-xs text-center font-semibold transition flex items-center justify-center gap-1 cursor-pointer ${
                   copiedElements.length > 0
-                    ? 'bg-indigo-950/50 hover:bg-indigo-900/40 border-indigo-800 text-indigo-200'
-                    : 'bg-slate-950/50 border-slate-900 text-slate-600 cursor-not-allowed'
+                    ? 'bg-blue-50 hover:bg-blue-100 border-blue-200 text-blue-700 shadow-sm'
+                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed'
                 }`}
                 title="Paste copied elements offset on canvas (Ctrl+V)"
               >
                 Paste ({copiedElements.length})
               </button>
             </div>
-            <p className="text-[9px] text-slate-500 font-mono text-center">
-              💡 Tip: You can use standard <strong className="text-slate-400">Ctrl + C</strong> and <strong className="text-slate-400">Ctrl + V</strong> keys!
+            <p className="text-[9px] text-slate-400 font-mono text-center">
+              💡 Tip: You can use standard <strong className="text-slate-500">Ctrl + C</strong> and <strong className="text-slate-500">Ctrl + V</strong> keys!
             </p>
           </div>
 
           {/* Section: Pathfinder Tools */}
-          <div className="p-4 border-b border-slate-800 bg-slate-950/40">
-            <h3 className="text-xs font-bold uppercase text-slate-400 tracking-wider mb-2.5">Pathfinder (Boolean Clipping)</h3>
-            <p className="text-[10px] text-slate-400 mb-3 leading-relaxed">
-              Select multiple overlapping elements on a layer to merge or carve complex vectors cleanly:
+          <div className="p-4 border-b border-slate-200/80 bg-slate-50/40">
+            <h3 className="text-xs font-bold uppercase text-slate-700 tracking-wider mb-2 flex items-center justify-between">
+              <span>Boolean Pathfinder</span>
+              {selectedElementIds.length >= 2 ? (
+                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-100 text-emerald-600 animate-pulse">
+                  ✨ {selectedElementIds.length} Shapes Selected
+                </span>
+              ) : (
+                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-amber-50 border border-amber-100 text-amber-600">
+                  ⚠️ Select 2+ overlapping shapes
+                </span>
+              )}
+            </h3>
+            <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">
+              Combine, intersect, or subtract overlapping elements to form complex custom paths with one-click:
             </p>
             <div className="grid grid-cols-2 gap-2">
               <button
                 onClick={() => handlePathfinder('union')}
-                className="py-2 px-3 bg-slate-850 hover:bg-indigo-900/40 hover:border-indigo-500 rounded border border-slate-800 text-xs text-slate-200 transition text-center font-semibold"
-                title="Join selected overlap paths"
+                disabled={selectedElementIds.length < 2}
+                className={`py-2 px-2 rounded border transition text-[11px] font-semibold shadow-sm flex flex-col items-center gap-1.5 justify-center ${
+                  selectedElementIds.length >= 2
+                    ? 'bg-white hover:bg-blue-50 hover:border-blue-300 border-slate-200 text-slate-700 cursor-pointer'
+                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed opacity-60'
+                }`}
+                title="Union: Combine multiple shapes into a single outline path"
               >
-                Union (Combine)
+                <svg className={`w-6 h-6 ${selectedElementIds.length >= 2 ? 'text-blue-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+                  <rect x="11" y="3" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+                  <rect x="11" y="11" width="2" height="2" fill="currentColor" fillOpacity="0.15" className="stroke-none" />
+                </svg>
+                <span>Union</span>
               </button>
+
               <button
                 onClick={() => handlePathfinder('subtract')}
-                className="py-2 px-3 bg-slate-850 hover:bg-red-900/40 hover:border-red-500 rounded border border-slate-800 text-xs text-slate-200 transition text-center font-semibold"
-                title="Subtract back shape from front"
+                disabled={selectedElementIds.length < 2}
+                className={`py-2 px-2 rounded border transition text-[11px] font-semibold shadow-sm flex flex-col items-center gap-1.5 justify-center ${
+                  selectedElementIds.length >= 2
+                    ? 'bg-white hover:bg-red-50 hover:border-red-300 border-slate-200 text-slate-700 cursor-pointer'
+                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed opacity-60'
+                }`}
+                title="Subtract: Cut the overlapping front shape outlines out from the back shape"
               >
-                Subtract (Carve)
+                <svg className={`w-6 h-6 ${selectedElementIds.length >= 2 ? 'text-red-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+                  <rect x="11" y="3" width="10" height="10" rx="1.5" fill="none" strokeDasharray="3 3" />
+                  <rect x="11" y="11" width="2" height="2" fill="white" className="stroke-none" />
+                </svg>
+                <span>Subtract</span>
               </button>
+
               <button
                 onClick={() => handlePathfinder('intersect')}
-                className="py-2 px-3 bg-slate-850 hover:bg-slate-850 rounded border border-slate-800 text-xs text-slate-200 transition text-center font-semibold"
-                title="Keep intersecting space"
+                disabled={selectedElementIds.length < 2}
+                className={`py-2 px-2 rounded border transition text-[11px] font-semibold shadow-sm flex flex-col items-center gap-1.5 justify-center ${
+                  selectedElementIds.length >= 2
+                    ? 'bg-white hover:bg-emerald-50 hover:border-emerald-300 border-slate-200 text-slate-700 cursor-pointer'
+                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed opacity-60'
+                }`}
+                title="Intersect: Retain only the region where all selected shapes overlap"
               >
-                Intersect
+                <svg className={`w-6 h-6 ${selectedElementIds.length >= 2 ? 'text-emerald-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="11" width="10" height="10" rx="1.5" fill="none" />
+                  <rect x="11" y="3" width="10" height="10" rx="1.5" fill="none" />
+                  <rect x="11" y="11" width="2" height="2" fill="currentColor" fillOpacity="0.4" />
+                </svg>
+                <span>Intersect</span>
               </button>
+
               <button
                 onClick={() => handlePathfinder('exclude')}
-                className="py-2 px-3 bg-slate-850 hover:bg-slate-850 rounded border border-slate-800 text-xs text-slate-200 transition text-center font-semibold"
-                title="Cut overlaps"
+                disabled={selectedElementIds.length < 2}
+                className={`py-2 px-2 rounded border transition text-[11px] font-semibold shadow-sm flex flex-col items-center gap-1.5 justify-center ${
+                  selectedElementIds.length >= 2
+                    ? 'bg-white hover:bg-amber-50 hover:border-amber-300 border-slate-200 text-slate-700 cursor-pointer'
+                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed opacity-60'
+                }`}
+                title="Exclude: Keep all regions of the shapes, excluding their overlapping intersection"
               >
-                Exclude (XOR)
+                <svg className={`w-6 h-6 ${selectedElementIds.length >= 2 ? 'text-amber-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+                  <rect x="11" y="3" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+                  <rect x="11" y="11" width="2" height="2" fill="white" className="stroke-none" />
+                </svg>
+                <span>Exclude</span>
               </button>
             </div>
           </div>
 
           {/* Section: Mirror & Symmetry Tools */}
-          <div className="p-4 border-b border-slate-800 bg-slate-950/40">
-            <h3 className="text-xs font-bold uppercase text-indigo-400 tracking-wider mb-2.5 flex items-center gap-1.5">
-              <Compass size={14} className="text-indigo-400" />
+          <div className="p-4 border-b border-slate-200/80 bg-slate-50/40">
+            <h3 className="text-xs font-bold uppercase text-blue-600 tracking-wider mb-2.5 flex items-center gap-1.5">
+              <Compass size={14} className="text-blue-600" />
               Mirror & Symmetry
             </h3>
-            <p className="text-[10px] text-slate-400 mb-3 leading-relaxed">
+            <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">
               Flip your selected vectors, or clone them symmetrically to create stunning repeating patterns:
             </p>
             
@@ -2352,18 +3053,18 @@ export default function App() {
               <div className="space-y-3">
                 {/* Sub-label: Flip Operations */}
                 <div>
-                  <div className="text-[9px] font-bold text-slate-500 uppercase tracking-wider mb-1">Flip Selected</div>
+                  <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Flip Selected</div>
                   <div className="grid grid-cols-2 gap-2">
                     <button
                       onClick={() => handleMirrorAction('flip-horizontal')}
-                      className="py-2 px-2 bg-slate-800 hover:bg-slate-750 hover:border-slate-600 rounded border border-slate-700 text-[11px] text-slate-200 transition text-center font-medium shadow-sm cursor-pointer"
+                      className="py-2 px-2 bg-white hover:bg-slate-50 hover:border-slate-400 rounded border border-slate-200 text-[11px] text-slate-700 transition text-center font-semibold shadow-sm cursor-pointer"
                       title="Flip selected elements horizontally"
                     >
                       ↔ Flip Horiz
                     </button>
                     <button
                       onClick={() => handleMirrorAction('flip-vertical')}
-                      className="py-2 px-2 bg-slate-800 hover:bg-slate-750 hover:border-slate-600 rounded border border-slate-700 text-[11px] text-slate-200 transition text-center font-medium shadow-sm cursor-pointer"
+                      className="py-2 px-2 bg-white hover:bg-slate-50 hover:border-slate-400 rounded border border-slate-200 text-[11px] text-slate-700 transition text-center font-semibold shadow-sm cursor-pointer"
                       title="Flip selected elements vertically"
                     >
                       ↕ Flip Vert
@@ -2373,18 +3074,18 @@ export default function App() {
 
                 {/* Sub-label: Mirror Duplicate Operations */}
                 <div>
-                  <div className="text-[9px] font-bold text-indigo-400 uppercase tracking-wider mb-1">Clone & Symmetrical Mirror</div>
+                  <div className="text-[9px] font-bold text-blue-600 uppercase tracking-wider mb-1">Clone & Symmetrical Mirror</div>
                   <div className="grid grid-cols-2 gap-2">
                     <button
                       onClick={() => handleMirrorAction('mirror-horizontal')}
-                      className="py-2 px-2 bg-indigo-950/40 hover:bg-indigo-900/60 border border-indigo-900 hover:border-indigo-500 rounded text-[11px] text-indigo-200 transition text-center font-semibold flex items-center justify-center gap-1 shadow-sm cursor-pointer"
+                      className="py-2 px-2 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded text-[11px] text-blue-700 transition text-center font-semibold flex items-center justify-center gap-1 shadow-sm cursor-pointer"
                       title="Duplicate and mirror across the horizontal center axis"
                     >
                       <span>👥 Mirror Left ↔ Right</span>
                     </button>
                     <button
                       onClick={() => handleMirrorAction('mirror-vertical')}
-                      className="py-2 px-2 bg-indigo-950/40 hover:bg-indigo-900/60 border border-indigo-900 hover:border-indigo-500 rounded text-[11px] text-indigo-200 transition text-center font-semibold flex items-center justify-center gap-1 shadow-sm cursor-pointer"
+                      className="py-2 px-2 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded text-[11px] text-blue-700 transition text-center font-semibold flex items-center justify-center gap-1 shadow-sm cursor-pointer"
                       title="Duplicate and mirror across the vertical center axis"
                     >
                       <span>👥 Mirror Top ↕ Bottom</span>
@@ -2393,7 +3094,7 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <div className="p-3 bg-slate-900/40 rounded border border-dashed border-slate-800 text-center text-slate-500 text-[11px]">
+              <div className="p-3 bg-slate-50/40 rounded border border-dashed border-slate-200 text-center text-slate-400 text-[11px]">
                 Select one or more items on the canvas to use the mirroring or flip tools.
               </div>
             )}
@@ -2401,12 +3102,12 @@ export default function App() {
 
           {/* Section: Tracing Image Parameters and Opacity */}
           {tracingImage && (
-            <div className="p-4 border-b border-slate-800 bg-slate-900/20">
+            <div className="p-4 border-b border-slate-200/80 bg-slate-50/20">
               <div className="flex justify-between items-center mb-2">
-                <h3 className="text-xs font-bold uppercase text-indigo-400 tracking-wider">Tracing Image Reference</h3>
+                <h3 className="text-xs font-bold uppercase text-blue-600 tracking-wider">Tracing Image Reference</h3>
                 <button
                   onClick={() => setTracingImage(null)}
-                  className="text-slate-500 hover:text-rose-400 text-[10px]"
+                  className="text-slate-400 hover:text-red-600 text-[10px] font-semibold"
                 >
                   Clear Image
                 </button>
@@ -2414,19 +3115,19 @@ export default function App() {
 
               <div className="space-y-3 text-xs">
                 {/* Switch tools */}
-                <div className="flex justify-between items-center text-[11px] text-slate-300">
-                  <span className="font-medium truncate max-w-[150px]">{tracingImage.name}</span>
+                <div className="flex justify-between items-center text-[11px] text-slate-700">
+                  <span className="font-semibold truncate max-w-[150px]">{tracingImage.name}</span>
                   <div className="flex gap-1.5">
                     <button
                       onClick={() => setTracingImage(t => t ? { ...t, visible: !t.visible } : null)}
-                      className={`p-1 rounded ${tracingImage.visible ? 'text-indigo-400 bg-slate-800' : 'text-slate-600'}`}
+                      className={`p-1 rounded transition ${tracingImage.visible ? 'text-blue-600 bg-blue-50 border border-blue-100 shadow-sm' : 'text-slate-400 hover:bg-slate-50'}`}
                       title="Toggle Visibility"
                     >
                       {tracingImage.visible ? <Eye size={13} /> : <EyeOff size={13} />}
                     </button>
                     <button
                       onClick={() => setTracingImage(t => t ? { ...t, locked: !t.locked } : null)}
-                      className={`p-1 rounded ${tracingImage.locked ? 'text-amber-500 bg-slate-800' : 'text-slate-600'}`}
+                      className={`p-1 rounded transition ${tracingImage.locked ? 'text-amber-600 bg-amber-50 border border-amber-100 shadow-sm' : 'text-slate-400 hover:bg-slate-50'}`}
                       title="Lock Placement"
                     >
                       {tracingImage.locked ? <Lock size={13} /> : <Unlock size={13} />}
@@ -2436,7 +3137,7 @@ export default function App() {
 
                 {/* Opacity slider */}
                 <div>
-                  <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                  <div className="flex justify-between text-[11px] text-slate-500 font-semibold mb-1">
                     <span>Translucency opacity</span>
                     <span>{Math.round(tracingImage.opacity * 100)}%</span>
                   </div>
@@ -2450,13 +3151,13 @@ export default function App() {
                       const val = parseFloat(e.target.value);
                       setTracingImage(prev => prev ? { ...prev, opacity: val } : null);
                     }}
-                    className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-indigo-500"
+                    className="w-full h-1 bg-slate-100 rounded appearance-none cursor-pointer accent-blue-600"
                   />
                 </div>
 
                 {/* Scale slider */}
                 <div>
-                  <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                  <div className="flex justify-between text-[11px] text-slate-500 font-semibold mb-1">
                     <span>Scale image reference</span>
                     <span>{Math.round(tracingImage.scale * 100)}%</span>
                   </div>
@@ -2470,13 +3171,13 @@ export default function App() {
                       const val = parseFloat(e.target.value);
                       setTracingImage(prev => prev ? { ...prev, scale: val } : null);
                     }}
-                    className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-indigo-500"
+                    className="w-full h-1 bg-slate-100 rounded appearance-none cursor-pointer accent-blue-600"
                   />
                 </div>
 
                 {/* Rotation control slider */}
                 <div>
-                  <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+                  <div className="flex justify-between text-[11px] text-slate-500 font-semibold mb-1">
                     <span>Rotate reference</span>
                     <span>{tracingImage.rotate}°</span>
                   </div>
@@ -2490,11 +3191,11 @@ export default function App() {
                       const val = parseInt(e.target.value);
                       setTracingImage(prev => prev ? { ...prev, rotate: val } : null);
                     }}
-                    className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-indigo-500"
+                    className="w-full h-1 bg-slate-100 rounded appearance-none cursor-pointer accent-blue-600"
                   />
                 </div>
 
-                <p className="text-[10px] text-slate-500 text-center leading-tight">
+                <p className="text-[10px] text-slate-400 text-center leading-tight">
                   💡 Drag image on canvas anytime when safety lock is unlocked in select pointing mode.
                 </p>
 
@@ -2505,10 +3206,10 @@ export default function App() {
           {/* Section: Layers Panel */}
           <div className="p-4 flex-1">
             <div className="flex justify-between items-center mb-3">
-              <h3 className="text-xs font-bold uppercase text-slate-400 tracking-wider">Layers Panel</h3>
+              <h3 className="text-xs font-bold uppercase text-slate-500 tracking-wider">Layers Panel</h3>
               <button
                 onClick={handleAddLayer}
-                className="flex items-center gap-1 text-[11px] text-indigo-400 hover:text-indigo-300 font-semibold"
+                className="flex items-center gap-1 text-[11px] text-blue-600 hover:text-blue-700 font-semibold"
                 title="Add blank vector layer"
               >
                 <Plus size={12} /> Add Layer
@@ -2523,14 +3224,14 @@ export default function App() {
                     key={l.id}
                     className={`p-2 rounded-lg border transition ${
                       isActive 
-                        ? 'bg-slate-900 border-indigo-500/70 shadow-sm' 
-                        : 'bg-slate-950/60 border-slate-900 hover:bg-slate-900/40'
+                        ? 'bg-blue-50/50 border-blue-200/80 shadow-sm' 
+                        : 'bg-white border-slate-200 hover:bg-slate-50'
                     }`}
                     onClick={() => setActiveLayerId(l.id)}
                   >
                     <div className="flex items-center justify-between gap-1.5 text-xs">
                       {/* Name & Selector */}
-                      <span className={`font-medium cursor-pointer truncate max-w-[124px] ${isActive ? 'text-white' : 'text-slate-300'}`}>
+                      <span className={`font-medium cursor-pointer truncate max-w-[124px] ${isActive ? 'text-slate-900 font-semibold' : 'text-slate-600'}`}>
                         {l.name}
                       </span>
 
@@ -2538,14 +3239,14 @@ export default function App() {
                       <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
                         <button
                           onClick={() => toggleLayerVisible(l.id)}
-                          className={`p-1 rounded ${l.visible ? 'text-slate-300 hover:text-white' : 'text-slate-600'}`}
+                          className={`p-1 rounded ${l.visible ? 'text-slate-500 hover:text-slate-800' : 'text-slate-300'}`}
                           title="Visibility"
                         >
                           {l.visible ? <Eye size={12} /> : <EyeOff size={11} />}
                         </button>
                         <button
                           onClick={() => toggleLayerLocked(l.id)}
-                          className={`p-1 rounded ${l.locked ? 'text-amber-500' : 'text-slate-600 hover:text-white'}`}
+                          className={`p-1 rounded ${l.locked ? 'text-amber-600' : 'text-slate-300 hover:text-slate-500'}`}
                           title="Lock layers"
                         >
                           {l.locked ? <Lock size={12} /> : <Unlock size={11} />}
@@ -2555,21 +3256,21 @@ export default function App() {
                         <button
                           onClick={() => handleReorderLayer(index, 'up')}
                           disabled={index === 0}
-                          className="text-slate-600 hover:text-slate-300 disabled:opacity-30 disabled:pointer-events-none"
+                          className="text-slate-400 hover:text-slate-700 disabled:opacity-30 disabled:pointer-events-none"
                         >
                           <ChevronUp size={12} />
                         </button>
                         <button
                           onClick={() => handleReorderLayer(index, 'down')}
                           disabled={index === layers.length - 1}
-                          className="text-slate-600 hover:text-slate-300 disabled:opacity-30 disabled:pointer-events-none"
+                          className="text-slate-400 hover:text-slate-700 disabled:opacity-30 disabled:pointer-events-none"
                         >
                           <ChevronDown size={12} />
                         </button>
 
                         <button
                           onClick={() => handleDeleteLayer(l.id)}
-                          className="text-slate-600 hover:text-rose-400 pl-1"
+                          className="text-slate-400 hover:text-red-600 pl-1"
                           title="Delete paint Layer"
                         >
                           <Trash2 size={11} />
@@ -2579,14 +3280,14 @@ export default function App() {
 
                     {/* Miniature element list inside current layer for detailed view */}
                     {l.elements.length > 0 && (
-                      <div className="mt-2 pl-2 space-y-1 border-l border-slate-800 text-[10px]">
+                      <div className="mt-2 pl-2 space-y-1 border-l border-slate-200 text-[10px]">
                         {l.elements.map(el => (
                           <div
                             key={el.id}
                             className={`flex justify-between items-center px-1.5 py-0.5 rounded ${
                               selectedElementIds.includes(el.id)
-                                ? 'bg-indigo-950/50 text-indigo-300 border border-indigo-900/60' 
-                                : 'text-slate-400 hover:text-slate-200'
+                                ? 'bg-blue-50 text-blue-750 border border-blue-100 font-semibold' 
+                                : 'text-slate-500 hover:text-slate-800'
                             }`}
                             onClick={(e) => {
                               e.stopPropagation();
@@ -2594,7 +3295,7 @@ export default function App() {
                             }}
                           >
                             <span className="truncate max-w-[120px]">{el.name}</span>
-                            <span className="font-mono text-[9px] text-slate-600">{el.nodes.length} nodes</span>
+                            <span className="font-mono text-[9px] text-slate-400">{el.nodes.length} nodes</span>
                           </div>
                         ))}
                       </div>
@@ -2609,10 +3310,10 @@ export default function App() {
       </div>
 
       {/* --- Simple Status bottom-rail --- */}
-      <footer className="h-8 bg-slate-950 border-t border-slate-850 px-6 flex items-center justify-between text-[11px] text-slate-500 font-mono z-25 select-none">
+      <footer className="h-8 bg-white border-t border-slate-200/80 px-6 flex items-center justify-between text-[11px] text-slate-500 font-mono z-25 select-none">
         <div>
-          Tool: <span className="text-slate-300 capitalize font-bold">{tool}</span>
-          {activePathId && <span className="text-indigo-400 ml-2 animate-pulse">• Active pen line drawing...</span>}
+          Tool: <span className="text-slate-800 capitalize font-bold">{tool}</span>
+          {activePathId && <span className="text-blue-600 ml-2 animate-pulse font-semibold">• Active pen line drawing...</span>}
         </div>
         <div className="flex gap-4">
           <span>Active layer nodes: {getActiveLayer().elements.reduce((acc, el) => acc + el.nodes.length, 0)}</span>
