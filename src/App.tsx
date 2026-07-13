@@ -25,7 +25,9 @@ import {
   Sparkles,
   HelpCircle,
   FileImage,
-  Undo
+  Undo,
+  Save,
+  FolderOpen
 } from 'lucide-react';
 import {
   Point,
@@ -100,6 +102,9 @@ export default function App() {
   // --- Background Reference Image State ---
   const [tracingImage, setTracingImage] = useState<TracingImage | null>(null);
 
+  // --- Copy/Paste buffer ---
+  const [copiedElements, setCopiedElements] = useState<PathElement[]>([]);
+
   // --- Current Properties For New Drawing Elements ---
   const [fillColor, setFillColor] = useState<string>('none');
   const [fillOpacity, setFillOpacity] = useState<number>(1);
@@ -120,6 +125,7 @@ export default function App() {
 
   // Reference for file picker triggers
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const projectFileInputRef = useRef<HTMLInputElement>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
 
   // Extract all elements across layers for calculations
@@ -261,6 +267,59 @@ export default function App() {
 
     setSelectedElementIds([result.id]);
     alert(`Pathfinder ${op.toUpperCase()} angitū! (Operation completed)`);
+  };
+
+  // --- COPY & PASTE ACTION ENGINES ---
+  const handleCopy = () => {
+    if (selectedElementIds.length === 0) return;
+    const selectedEls = getAllElements().filter(el => selectedElementIds.includes(el.id));
+    setCopiedElements(JSON.parse(JSON.stringify(selectedEls)));
+  };
+
+  const handlePaste = () => {
+    if (copiedElements.length === 0) return;
+    const offset = 24; // offset grid step for copy placement so it is highly visible
+    const newPastedElements = copiedElements.map(el => {
+      const newNodes = el.nodes.map(node => {
+        const anchor = { x: node.anchor.x + offset, y: node.anchor.y + offset };
+        const handleIn = node.handleIn
+          ? { x: node.handleIn.x + offset, y: node.handleIn.y + offset }
+          : undefined;
+        const handleOut = node.handleOut
+          ? { x: node.handleOut.x + offset, y: node.handleOut.y + offset }
+          : undefined;
+        return {
+          ...node,
+          id: `node-${Math.random().toString(36).substr(2, 5)}`,
+          anchor,
+          handleIn,
+          handleOut,
+        };
+      });
+      return {
+        ...el,
+        id: `el-${Math.random().toString(36).substr(2, 9)}`,
+        name: `${el.name} (Copy)`,
+        nodes: newNodes,
+      };
+    });
+
+    setLayers(prev =>
+      prev.map(layer => {
+        if (layer.id === activeLayerId) {
+          return {
+            ...layer,
+            elements: [...layer.elements, ...newPastedElements]
+          };
+        }
+        return layer;
+      })
+    );
+
+    const newIds = newPastedElements.map(el => el.id);
+    setSelectedElementIds(newIds);
+    // Offset subsequent pastes sequentially by saving the newly offset elements as the copy source
+    setCopiedElements(newPastedElements);
   };
 
   // --- MIRROR & SYMMETRY ACTIONS ---
@@ -968,7 +1027,15 @@ export default function App() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (document.activeElement?.tagName === 'INPUT') return;
 
-      if (e.key === 'Delete' || e.key === 'Backspace') {
+      const isModKey = e.ctrlKey || e.metaKey;
+
+      if (isModKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        handleCopy();
+      } else if (isModKey && (e.key === 'v' || e.key === 'V')) {
+        e.preventDefault();
+        handlePaste();
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedNodeInfo && tool === 'direct-select') {
           // Delete selected node
           const { elementId, nodeId } = selectedNodeInfo;
@@ -1008,7 +1075,43 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedElementIds, selectedNodeInfo, activePathId, tool]);
+  }, [selectedElementIds, selectedNodeInfo, activePathId, tool, copiedElements, layers, activeLayerId]);
+
+  // --- MOUSE WHEEL ZOOM ON CANVAS ---
+  useEffect(() => {
+    const container = canvasContainerRef.current;
+    if (!container) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+
+      const rect = container.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      // Calculate zoom factor based on scroll velocity/direction
+      const zoomIntensity = 0.08;
+      const delta = -e.deltaY;
+      const factor = delta > 0 ? 1 + zoomIntensity : 1 - zoomIntensity;
+
+      setZoom(prevZoom => {
+        const nextZoom = Math.max(0.15, Math.min(8, prevZoom * factor));
+        
+        // Pivot the offset so the zoom centers around the cursor position
+        setPanOffset(prevPan => ({
+          x: mouseX - (mouseX - prevPan.x) * (nextZoom / prevZoom),
+          y: mouseY - (mouseY - prevPan.y) * (nextZoom / prevZoom),
+        }));
+
+        return nextZoom;
+      });
+    };
+
+    container.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      container.removeEventListener('wheel', handleWheel);
+    };
+  }, []);
 
   // --- SVG DOWNLOAD GENERATOR ---
   const handleExportSVG = () => {
@@ -1054,6 +1157,72 @@ export default function App() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+  };
+
+  // --- PROJECT SAVE & LOAD (WORKING FILE JSON) ---
+  const handleExportProject = () => {
+    const projectData = {
+      version: "1.0",
+      layers,
+      activeLayerId,
+      tracingImage,
+      grid,
+      snapToPoints
+    };
+    const jsonString = JSON.stringify(projectData, null, 2);
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `vector-project-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  const handleImportProject = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const parsed = JSON.parse(event.target?.result as string);
+        if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.layers)) {
+          alert("Kāore i whaimana te kōnae project (Invalid vector project file format).");
+          return;
+        }
+
+        setLayers(parsed.layers);
+        if (parsed.activeLayerId) {
+          setActiveLayerId(parsed.activeLayerId);
+        } else if (parsed.layers.length > 0) {
+          setActiveLayerId(parsed.layers[0].id);
+        }
+
+        if (parsed.tracingImage !== undefined) {
+          setTracingImage(parsed.tracingImage);
+        }
+        if (parsed.grid) {
+          setGrid(parsed.grid);
+        }
+        if (parsed.snapToPoints !== undefined) {
+          setSnapToPoints(parsed.snapToPoints);
+        }
+
+        // Reset selections to avoid stale references
+        setSelectedElementIds([]);
+        setSelectedNodeInfo(null);
+        setSelectedHandle(null);
+
+        alert("Kua rari te kōnae mahi! Project file successfully loaded.");
+      } catch (err) {
+        alert("Ngaro i te pānui kōnae (Error reading project file): " + (err as Error).message);
+      }
+      // Reset input value so same file can be uploaded again
+      e.target.value = '';
+    };
+    reader.readAsText(file);
   };
 
   // Convert currently selected element to use template parameters instantly for speed
@@ -1130,6 +1299,35 @@ export default function App() {
             accept="image/*"
             className="hidden"
           />
+
+          <button
+            onClick={handleExportProject}
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-700/80 text-indigo-300 hover:text-indigo-100 rounded-lg font-medium text-xs transition shadow-md cursor-pointer"
+            title="Save working project file (.json) to resume later"
+          >
+            <Save size={14} />
+            Save Project
+          </button>
+
+          <button
+            onClick={() => {
+              if (projectFileInputRef.current) projectFileInputRef.current.click();
+            }}
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-900 hover:bg-slate-850 border border-slate-700 text-slate-300 hover:text-white rounded-lg font-medium text-xs transition shadow-md cursor-pointer"
+            title="Open/Upload a previously saved working project file (.json)"
+          >
+            <FolderOpen size={14} />
+            Open Project
+          </button>
+          <input
+            type="file"
+            ref={projectFileInputRef}
+            onChange={handleImportProject}
+            accept=".json,application/json"
+            className="hidden"
+          />
+
+          <div className="h-6 w-[1px] bg-slate-800 my-auto mx-1"></div>
 
           <button
             onClick={handleExportSVG}
@@ -1777,6 +1975,42 @@ export default function App() {
               )}
 
             </div>
+          </div>
+
+          {/* Section: Clipboard Actions */}
+          <div className="p-4 border-b border-slate-800 bg-slate-950/40">
+            <h3 className="text-xs font-bold uppercase text-indigo-400 tracking-wider mb-2.5 flex items-center gap-1.5">
+              <span>📋 Clipboard Actions</span>
+            </h3>
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              <button
+                onClick={handleCopy}
+                disabled={selectedElementIds.length === 0}
+                className={`py-2 px-3 rounded border text-xs text-center font-semibold transition flex items-center justify-center gap-1 cursor-pointer ${
+                  selectedElementIds.length > 0
+                    ? 'bg-slate-850 hover:bg-slate-800 border-slate-700 text-slate-100'
+                    : 'bg-slate-950/50 border-slate-900 text-slate-600 cursor-not-allowed'
+                }`}
+                title="Copy selected elements to clipboard (Ctrl+C)"
+              >
+                Copy Selection
+              </button>
+              <button
+                onClick={handlePaste}
+                disabled={copiedElements.length === 0}
+                className={`py-2 px-3 rounded border text-xs text-center font-semibold transition flex items-center justify-center gap-1 cursor-pointer ${
+                  copiedElements.length > 0
+                    ? 'bg-indigo-950/50 hover:bg-indigo-900/40 border-indigo-800 text-indigo-200'
+                    : 'bg-slate-950/50 border-slate-900 text-slate-600 cursor-not-allowed'
+                }`}
+                title="Paste copied elements offset on canvas (Ctrl+V)"
+              >
+                Paste ({copiedElements.length})
+              </button>
+            </div>
+            <p className="text-[9px] text-slate-500 font-mono text-center">
+              💡 Tip: You can use standard <strong className="text-slate-400">Ctrl + C</strong> and <strong className="text-slate-400">Ctrl + V</strong> keys!
+            </p>
           </div>
 
           {/* Section: Pathfinder Tools */}
