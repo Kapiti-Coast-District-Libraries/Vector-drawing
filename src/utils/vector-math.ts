@@ -42,7 +42,7 @@ export function getPathData(nodes: VectorNode[], closed: boolean): string {
   return d;
 }
 
-function getSegmentCommand(fromNode: VectorNode, toNode: VectorNode): string {
+export function getSegmentCommand(fromNode: VectorNode, toNode: VectorNode): string {
   const h1 = fromNode.handleOut;
   const h2 = toNode.handleIn;
 

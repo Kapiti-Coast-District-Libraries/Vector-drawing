@@ -44,7 +44,8 @@ import {
   getPathData,
   performPathfinder,
   snapPoint,
-  distance
+  distance,
+  getSegmentCommand
 } from './utils/vector-math';
 import {
   getSpiralTemplate,
@@ -73,7 +74,7 @@ export default function App() {
     {
       id: 'layer-1',
       name: 'Art Layer 1',
-      elements: [getSpiralTemplate()], // Preload a beautiful spiral swirl so the canvas is inviting on turn 1
+      elements: [], // Preload empty so the canvas is fresh and clean on load
       visible: true,
       locked: false,
     }
@@ -84,7 +85,7 @@ export default function App() {
   const [tool, setTool] = useState<ToolType>('select');
 
   // --- Selection States ---
-  const [selectedElementIds, setSelectedElementIds] = useState<string[]>(['starter-spiral']);
+  const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
   const [selectedNodeInfo, setSelectedNodeInfo] = useState<{ elementId: string; nodeId: string } | null>(null);
   const [selectedHandle, setSelectedHandle] = useState<'anchor' | 'handleIn' | 'handleOut' | null>(null);
 
@@ -115,6 +116,13 @@ export default function App() {
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [dragStartCanvasPos, setDragStartCanvasPos] = useState<Point>({ x: 0, y: 0 });
   const [dragStartElementsBackup, setDragStartElementsBackup] = useState<PathElement[]>([]);
+  const [draggedSegment, setDraggedSegment] = useState<{
+    elementId: string;
+    fromNodeIdx: number;
+    toNodeIdx: number;
+    t: number;
+    startNodes: VectorNode[];
+  } | null>(null);
   const [dragImageStartPos, setDragImageStartPos] = useState<{ x: number; y: number } | null>(null);
 
   // --- Drag-over Overlay for file tracing loading ---
@@ -691,6 +699,68 @@ export default function App() {
       return;
     }
 
+    // --- CASE 2.5: Dragging and bending a path segment ---
+    if (tool === 'direct-select' && isDragging && draggedSegment) {
+      const { elementId, fromNodeIdx, toNodeIdx, t, startNodes } = draggedSegment;
+      const dx = rawPos.x - dragStartCanvasPos.x;
+      const dy = rawPos.y - dragStartCanvasPos.y;
+
+      setLayers(prev =>
+        prev.map(layer => ({
+          ...layer,
+          elements: layer.elements.map(el => {
+            if (el.id === elementId) {
+              const newNodes = [...el.nodes];
+
+              // Fetch the original node states from the start backup
+              const fromNodeStart = startNodes[fromNodeIdx];
+              const toNodeStart = startNodes[toNodeIdx];
+
+              // Base anchors are fixed during a segment drag
+              const A = fromNodeStart.anchor;
+              const B = toNodeStart.anchor;
+
+              // Initialize handle start values if undefined, using anchor as origin
+              const h1_start = fromNodeStart.handleOut || { x: A.x, y: A.y };
+              const h2_start = toNodeStart.handleIn || { x: B.x, y: B.y };
+
+              // Apply the calculated weighted offset to bend the curve
+              // We use 1.33 as the cubic bezier factor for intuitive cursor tracking
+              const h1_new = {
+                x: h1_start.x + dx * (1 - t) * 1.33,
+                y: h1_start.y + dy * (1 - t) * 1.33,
+              };
+
+              const h2_new = {
+                x: h2_start.x + dx * t * 1.33,
+                y: h2_start.y + dy * t * 1.33,
+              };
+
+              // Update the node objects inside the array.
+              newNodes[fromNodeIdx] = {
+                ...newNodes[fromNodeIdx],
+                handleOut: h1_new,
+                type: newNodes[fromNodeIdx].type === 'corner' ? 'corner' : 'smooth',
+              };
+
+              newNodes[toNodeIdx] = {
+                ...newNodes[toNodeIdx],
+                handleIn: h2_new,
+                type: newNodes[toNodeIdx].type === 'corner' ? 'corner' : 'smooth',
+              };
+
+              return {
+                ...el,
+                nodes: newNodes,
+              };
+            }
+            return el;
+          }),
+        }))
+      );
+      return;
+    }
+
     // --- CASE 2: Dragging selected anchor point or bezier handle (Node Editor) ---
     if (tool === 'direct-select' && isDragging && selectedNodeInfo && selectedHandle) {
       const { elementId, nodeId } = selectedNodeInfo;
@@ -853,6 +923,7 @@ export default function App() {
     setIsDrawingDrag(false);
     setSelectedHandle(null);
     setDragImageStartPos(null);
+    setDraggedSegment(null);
   };
 
   // --- DOUBLE CLICK TO SHARPEN / SMOOTH NODE CONVERSION ---
@@ -883,6 +954,55 @@ export default function App() {
     );
   };
 
+  const handleSegmentMouseDown = (
+    e: React.MouseEvent,
+    elId: string,
+    fromIdx: number,
+    toIdx: number,
+    fromNode: VectorNode,
+    toNode: VectorNode
+  ) => {
+    e.stopPropagation();
+    if (e.button !== 0) return; // Only left click
+
+    // Ensure we are in direct-select tool to bend curves
+    if (tool !== 'direct-select') {
+      setTool('direct-select');
+    }
+
+    // Select the element if not already selected
+    if (!selectedElementIds.includes(elId)) {
+      setSelectedElementIds([elId]);
+    }
+
+    // Clear any previous node specific selections to avoid conflicting handle overlays
+    setSelectedNodeInfo(null);
+    setSelectedHandle(null);
+
+    const canvasPos = getCanvasCoords(e);
+    
+    // Find the actual element
+    const allEls = getAllElements();
+    const el = allEls.find(item => item.id === elId);
+    if (!el) return;
+
+    // Calculate approximate parameter t along the clicked segment
+    const distA = distance(fromNode.anchor, canvasPos);
+    const distB = distance(toNode.anchor, canvasPos);
+    const t = Math.max(0.15, Math.min(0.85, distA / (distA + distB || 1)));
+
+    setDraggedSegment({
+      elementId: elId,
+      fromNodeIdx: fromIdx,
+      toNodeIdx: toIdx,
+      t,
+      startNodes: JSON.parse(JSON.stringify(el.nodes)),
+    });
+
+    setDragStartCanvasPos(canvasPos);
+    setIsDragging(true);
+  };
+
   // --- NODE ELEMENT CLICKS (Anchor selection & Handle Grab starting) ---
   const handleNodeMouseDown = (
     e: React.MouseEvent,
@@ -892,22 +1012,59 @@ export default function App() {
   ) => {
     e.stopPropagation(); // prevent background canvas drags
 
-    if (tool === 'pen' && activePathId === elementId) {
-      // Click start node to close pen path
-      const activeEl = getAllElements().find(el => el.id === activePathId);
-      if (activeEl && activeEl.nodes[0].id === nodeId && activeEl.nodes.length > 2) {
-        setLayers(prev =>
-          prev.map(layer => ({
-            ...layer,
-            elements: layer.elements.map(el =>
-              el.id === activePathId ? { ...el, closed: true } : el
-            ),
-          }))
-        );
-        setActivePathId(null);
-        setPenPreviewPos(null);
-        setIsDrawingDrag(false);
-        return;
+    if (tool === 'pen') {
+      const el = getAllElements().find(item => item.id === elementId);
+      if (el && !el.closed) {
+        const isStartNode = el.nodes[0].id === nodeId;
+        const isEndNode = el.nodes[el.nodes.length - 1].id === nodeId;
+
+        if (isStartNode || isEndNode) {
+          // If we clicked the start node of the ACTIVE path, close it!
+          if (activePathId === elementId && isStartNode && el.nodes.length > 2) {
+            setLayers(prev =>
+              prev.map(layer => ({
+                ...layer,
+                elements: layer.elements.map(item =>
+                  item.id === activePathId ? { ...item, closed: true } : item
+                ),
+              }))
+            );
+            setActivePathId(null);
+            setPenPreviewPos(null);
+            setIsDrawingDrag(false);
+            return;
+          }
+
+          // Otherwise, we want to resume drawing/building from this endpoint!
+          if (isStartNode) {
+            // Reverse nodes array so we always append to the end of the array
+            setLayers(prev =>
+              prev.map(layer => ({
+                ...layer,
+                elements: layer.elements.map(item => {
+                  if (item.id === elementId) {
+                    return {
+                      ...item,
+                      nodes: [...item.nodes].reverse().map(node => ({
+                        ...node,
+                        handleIn: node.handleOut,
+                        handleOut: node.handleIn,
+                      })),
+                    };
+                  }
+                  return item;
+                }),
+              }))
+            );
+          }
+
+          setActivePathId(elementId);
+          setSelectedElementIds([elementId]);
+          setSelectedNodeInfo({ elementId, nodeId });
+          setSelectedHandle('anchor');
+          setIsDrawingDrag(true);
+          return;
+        }
       }
     }
 
@@ -931,6 +1088,51 @@ export default function App() {
 
     const el = getAllElements().find(v => v.id === elementId);
     if (el?.locked) return; // locked elements cannot be interacted with
+
+    if (tool === 'pen') {
+      if (el && !el.closed) {
+        // Find if closest endpoint is start or end
+        const canvasPos = getCanvasCoords(e);
+        const distToStart = distance(canvasPos, el.nodes[0].anchor);
+        const distToEnd = distance(canvasPos, el.nodes[el.nodes.length - 1].anchor);
+
+        const targetNodeId = distToStart < distToEnd ? el.nodes[0].id : el.nodes[el.nodes.length - 1].id;
+
+        if (distToStart < distToEnd) {
+          // Reverse nodes so that we can append to the end of the array
+          setLayers(prev =>
+            prev.map(layer => ({
+              ...layer,
+              elements: layer.elements.map(item => {
+                if (item.id === elementId) {
+                  return {
+                    ...item,
+                    nodes: [...item.nodes].reverse().map(node => ({
+                      ...node,
+                      handleIn: node.handleOut,
+                      handleOut: node.handleIn,
+                    })),
+                  };
+                }
+                return item;
+              }),
+            }))
+          );
+        }
+
+        // Set this path as the active drawing path
+        setActivePathId(elementId);
+        setSelectedElementIds([elementId]);
+        setSelectedNodeInfo({ elementId, nodeId: targetNodeId });
+        setSelectedHandle('anchor');
+        setPenPreviewPos(null);
+        return;
+      } else if (el) {
+        // If it's already closed, make it selected
+        setSelectedElementIds([elementId]);
+        return;
+      }
+    }
 
     if (tool === 'direct-select') {
       setSelectedElementIds([elementId]);
@@ -1022,6 +1224,60 @@ export default function App() {
     setLayers(updated);
   };
 
+  const activatePenTool = () => {
+    setTool('pen');
+    const selectedEls = getAllElements().filter(e => selectedElementIds.includes(e.id));
+    if (selectedEls.length === 1 && !selectedEls[0].closed) {
+      const el = selectedEls[0];
+      setActivePathId(el.id);
+      if (el.nodes.length > 0) {
+        // Determine which node to continue from based on current selectedNodeInfo if any
+        let targetNode = el.nodes[el.nodes.length - 1];
+        const hasSelectedNode = selectedNodeInfo && selectedNodeInfo.elementId === el.id;
+        const isStartSelected = hasSelectedNode && el.nodes[0] && selectedNodeInfo.nodeId === el.nodes[0].id;
+        const isEndSelected = hasSelectedNode && el.nodes[el.nodes.length - 1] && selectedNodeInfo.nodeId === el.nodes[el.nodes.length - 1].id;
+
+        if (hasSelectedNode && (isStartSelected || isEndSelected)) {
+          if (isStartSelected) {
+            // Reverse nodes so that start node becomes the end node we append to!
+            setLayers(prev =>
+              prev.map(layer => ({
+                ...layer,
+                elements: layer.elements.map(item => {
+                  if (item.id === el.id) {
+                    const revNodes = [...item.nodes].reverse().map(node => ({
+                      ...node,
+                      handleIn: node.handleOut,
+                      handleOut: node.handleIn,
+                    }));
+                    return {
+                      ...item,
+                      nodes: revNodes,
+                    };
+                  }
+                  return item;
+                }),
+              }))
+            );
+            // The target node is now the first node (which becomes the last node after reversing)
+            targetNode = el.nodes[0];
+          } else {
+            targetNode = el.nodes[el.nodes.length - 1];
+          }
+        } else {
+          // Default to last node
+          targetNode = el.nodes[el.nodes.length - 1];
+        }
+
+        setSelectedNodeInfo({ elementId: el.id, nodeId: targetNode.id });
+        setSelectedHandle('anchor');
+      }
+    } else {
+      setActivePathId(null);
+    }
+    setPenPreviewPos(null);
+  };
+
   // Delete key stroke to instantly delete selected nodes or elements
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1070,6 +1326,15 @@ export default function App() {
           setActivePathId(null);
           setPenPreviewPos(null);
         }
+      } else if (e.key === 'p' || e.key === 'P') {
+        e.preventDefault();
+        activatePenTool();
+      } else if (e.key === 's' || e.key === 'S' || e.key === 'a' || e.key === 'A') {
+        e.preventDefault();
+        setTool('direct-select');
+      } else if (e.key === 'v' || e.key === 'V') {
+        e.preventDefault();
+        setTool('select');
       }
     };
 
@@ -1424,10 +1689,7 @@ export default function App() {
 
           <button
             onClick={() => {
-              setTool('pen');
-              // Clear previous pen if toggling away
-              setActivePathId(null);
-              setPenPreviewPos(null);
+              activatePenTool();
             }}
             className={`p-3 rounded-lg transition relative group ${
               tool === 'pen' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
@@ -1677,6 +1939,31 @@ export default function App() {
                               className="pointer-events-none"
                             />
                           )}
+
+                          {/* Render interactive path segments in direct-select mode */}
+                          {tool === 'direct-select' && isSelected && !el.locked && (
+                            <g>
+                              {el.nodes.map((node, idx) => {
+                                if (idx === el.nodes.length - 1 && !el.closed) return null;
+                                const nextIdx = idx === el.nodes.length - 1 ? 0 : idx + 1;
+                                const nextNode = el.nodes[nextIdx];
+
+                                const segmentD = `M ${node.anchor.x} ${node.anchor.y}` + getSegmentCommand(node, nextNode);
+
+                                return (
+                                  <path
+                                    key={`segment-${idx}`}
+                                    d={segmentD}
+                                    fill="none"
+                                    stroke="transparent"
+                                    strokeWidth={10}
+                                    className="hover:stroke-indigo-400/50 cursor-grab active:cursor-grabbing transition-colors duration-75"
+                                    onMouseDown={(e) => handleSegmentMouseDown(e, el.id, idx, nextIdx, node, nextNode)}
+                                  />
+                                );
+                              })}
+                            </g>
+                          )}
                         </g>
                       );
                     })}
@@ -1710,8 +1997,8 @@ export default function App() {
                 })()
               )}
 
-              {/* 5. Direct Select Mode: Node handles / anchor point markers */}
-              {tool === 'direct-select' && (
+              {/* 5. Direct Select / Pen Mode: Node handles / anchor point markers */}
+              {(tool === 'direct-select' || tool === 'pen') && (
                 layers.map(layer => {
                   if (!layer.visible) return null;
                   return layer.elements.map(el => {
