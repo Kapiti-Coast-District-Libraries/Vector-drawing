@@ -29,7 +29,8 @@ import {
   Undo,
   Redo,
   Save,
-  FolderOpen
+  FolderOpen,
+  Spline
 } from 'lucide-react';
 import {
   Point,
@@ -58,6 +59,7 @@ import {
 } from './utils/starter-templates';
 import { exportToDXF } from './utils/dxf-exporter';
 import { mirrorElement, getCombinedBoundingBox, getElementBoundingBox } from './utils/mirror-utils';
+import { convertStrokeToPath, StrokeToPathOptions } from './utils/stroke-to-path';
 
 // Professional designer color palette for vector assets
 const ART_PALETTE = [
@@ -169,7 +171,10 @@ export default function App() {
   const [isMiddleClickPanning, setIsMiddleClickPanning] = useState<boolean>(false);
   const selectionStartWithShiftRef = useRef<boolean>(false);
   const initialSelectedIdsRef = useRef<string[]>([]);
-  const [activeFlyout, setActiveFlyout] = useState<'pathfinder' | 'mirror' | null>(null);
+  const [activeFlyout, setActiveFlyout] = useState<'pathfinder' | 'mirror' | 'strokeToPath' | null>(null);
+  const [strokeToPathMode, setStrokeToPathMode] = useState<'outline' | 'dual-lines'>('outline');
+  const [strokeToPathCap, setStrokeToPathCap] = useState<'round' | 'butt' | 'square'>('round');
+  const [strokeToPathKeepOriginal, setStrokeToPathKeepOriginal] = useState<boolean>(false);
 
   // --- Resizing / Transforming States ---
   const [isResizing, setIsResizing] = useState<boolean>(false);
@@ -643,6 +648,67 @@ export default function App() {
       const newIds = newMirroredElements.map(el => el.id);
       setSelectedElementIds(newIds);
     }
+  };
+
+  // --- STROKE TO PATH (OUTLINE STROKE) ACTION ---
+  const handleStrokeToPath = (optionsOverride?: Partial<StrokeToPathOptions>) => {
+    const allEls = getAllElements();
+    const selectedEls = allEls.filter(el => selectedElementIds.includes(el.id));
+
+    if (selectedEls.length === 0) {
+      alert("Tēnā koa, whiria tētahi ara whiu (Please select at least one path with a stroke to convert).");
+      return;
+    }
+
+    pushHistory(layers);
+
+    const mergedOptions: StrokeToPathOptions = {
+      mode: strokeToPathMode,
+      cap: strokeToPathCap,
+      keepOriginal: strokeToPathKeepOriginal,
+      ...optionsOverride,
+    };
+
+    const newGeneratedElements: PathElement[] = [];
+    const elementsToRemoveIds: string[] = [];
+
+    selectedEls.forEach(el => {
+      const generated = convertStrokeToPath(el, mergedOptions);
+      if (generated.length > 0) {
+        newGeneratedElements.push(...generated);
+        if (!mergedOptions.keepOriginal) {
+          elementsToRemoveIds.push(el.id);
+        }
+      }
+    });
+
+    if (newGeneratedElements.length === 0) {
+      alert("Could not convert stroke to path. Please ensure the path has at least 2 anchor points and a stroke width.");
+      return;
+    }
+
+    setLayers(prev =>
+      prev.map(layer => {
+        const remainingElements = elementsToRemoveIds.length > 0
+          ? layer.elements.filter(el => !elementsToRemoveIds.includes(el.id))
+          : layer.elements;
+
+        if (layer.id === activeLayerId) {
+          return {
+            ...layer,
+            elements: [...remainingElements, ...newGeneratedElements],
+          };
+        }
+        return {
+          ...layer,
+          elements: remainingElements,
+        };
+      })
+    );
+
+    const newIds = newGeneratedElements.map(e => e.id);
+    setSelectedElementIds(newIds);
+    setTool('select');
   };
 
   // --- Tracing Image Loader ---
@@ -2249,6 +2315,9 @@ export default function App() {
       } else if (isModKey && (e.key === 'v' || e.key === 'V')) {
         e.preventDefault();
         handlePaste();
+      } else if (isModKey && e.shiftKey && (e.key === 'o' || e.key === 'O')) {
+        e.preventDefault();
+        handleStrokeToPath();
       } else if (isModKey && (e.key === 'd' || e.key === 'D')) {
         e.preventDefault();
         handleRepeatTransform();
@@ -2653,6 +2722,7 @@ export default function App() {
             <ul className="space-y-1 text-slate-500 list-disc list-inside">
               <li><strong className="text-slate-800">Pen Tool</strong>: Click to place nodes, <strong className="text-red-600">click & drag</strong> to stretch smooth handles. Click the first node to close the path!</li>
               <li><strong className="text-slate-800">Direct Select</strong>: Double-click nodes to <strong className="text-emerald-600">sharpen corner</strong> joints immediately! Drag anchors or handles to warp curves.</li>
+              <li><strong className="text-slate-800">Stroke to Path</strong>: Trace either side of any stroke into editable outline paths or dual boundary lines (<strong className="text-purple-600 font-mono">Ctrl+Shift+O</strong>).</li>
               <li><strong className="text-slate-800">Pathfinder Operations</strong>: Overlap shapes, select both, and click Union or Subtract to carve unique vectors.</li>
               <li><span className="text-slate-800 font-semibold">Tracing Background</span>: Drop any PNG, JPG, or SVG reference onto the canvas to draw over with precision.</li>
             </ul>
@@ -2816,6 +2886,24 @@ export default function App() {
             <Compass size={18} className={selectedElementIds.length > 0 ? "animate-spin-slow" : ""} />
             <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
               Mirror & Symmetry {selectedElementIds.length === 0 ? '(Select 1+ shapes)' : ''}
+            </span>
+          </button>
+
+          {/* Stroke to Path (Outline Stroke) Flyout Button */}
+          <button
+            onClick={() => setActiveFlyout(prev => prev === 'strokeToPath' ? null : 'strokeToPath')}
+            className={`p-3 rounded-lg transition relative group ${
+              activeFlyout === 'strokeToPath'
+                ? 'bg-purple-600 text-white shadow-sm'
+                : selectedElementIds.length > 0
+                ? 'bg-purple-50 text-purple-600 hover:bg-purple-100 border border-purple-100'
+                : 'text-slate-300 hover:bg-slate-50'
+            }`}
+            title="Stroke to Path / Outline Stroke (Ctrl+Shift+O)"
+          >
+            <Spline size={18} />
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              Stroke to Path (Outline Stroke) {selectedElementIds.length === 0 ? '(Select 1+ paths)' : ''}
             </span>
           </button>
 
@@ -3008,6 +3096,106 @@ export default function App() {
             >
               <span className="text-emerald-500 text-sm">👥</span>
               <span>Mirror Top ↕ Bottom</span>
+            </button>
+          </div>
+        )}
+
+        {activeFlyout === 'strokeToPath' && (
+          <div className="absolute left-16 top-[470px] w-64 bg-white border border-slate-200 rounded-lg shadow-xl py-2.5 px-3 z-50 animate-in fade-in slide-in-from-left-2 duration-150">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-2 mb-2">
+              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
+                <Spline size={13} className="text-purple-600" />
+                Stroke to Path
+              </span>
+              {selectedElementIds.length > 0 ? (
+                <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-purple-50 text-purple-600">
+                  {selectedElementIds.length} Selected
+                </span>
+              ) : (
+                <span className="text-[9px] text-amber-500 font-medium">Select a path</span>
+              )}
+            </div>
+
+            {/* Output Mode Selection */}
+            <div className="mb-2.5">
+              <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Trace Output Mode</div>
+              <div className="grid grid-cols-2 gap-1 text-[10px]">
+                <button
+                  type="button"
+                  onClick={() => setStrokeToPathMode('outline')}
+                  className={`py-1.5 px-2 rounded border text-center font-medium transition ${
+                    strokeToPathMode === 'outline'
+                      ? 'bg-purple-600 border-purple-700 text-white shadow-xs'
+                      : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                  }`}
+                  title="Trace both sides + caps into a single closed filled outline path"
+                >
+                  Outline Shape
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setStrokeToPathMode('dual-lines')}
+                  className={`py-1.5 px-2 rounded border text-center font-medium transition ${
+                    strokeToPathMode === 'dual-lines'
+                      ? 'bg-purple-600 border-purple-700 text-white shadow-xs'
+                      : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                  }`}
+                  title="Trace both sides into 2 separate editable open path lines"
+                >
+                  Dual Path Lines
+                </button>
+              </div>
+            </div>
+
+            {/* Cap Style (for open paths) */}
+            {strokeToPathMode === 'outline' && (
+              <div className="mb-2.5">
+                <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">End Cap Style</div>
+                <div className="grid grid-cols-3 gap-1 text-[10px]">
+                  {(['round', 'butt', 'square'] as const).map(c => (
+                    <button
+                      key={c}
+                      type="button"
+                      onClick={() => setStrokeToPathCap(c)}
+                      className={`py-1 rounded border capitalize text-center font-medium transition ${
+                        strokeToPathCap === c
+                          ? 'bg-purple-50 border-purple-300 text-purple-700 font-bold'
+                          : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                      }`}
+                    >
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Keep Original Option */}
+            <div className="flex items-center justify-between mb-3 text-[11px] text-slate-600">
+              <span>Keep original stroke</span>
+              <input
+                type="checkbox"
+                checked={strokeToPathKeepOriginal}
+                onChange={e => setStrokeToPathKeepOriginal(e.target.checked)}
+                className="w-3.5 h-3.5 rounded text-purple-600 focus:ring-purple-500"
+              />
+            </div>
+
+            {/* Action Execution Button */}
+            <button
+              onClick={() => {
+                handleStrokeToPath();
+                setActiveFlyout(null);
+              }}
+              disabled={selectedElementIds.length === 0}
+              className={`w-full py-2 px-3 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition shadow-sm ${
+                selectedElementIds.length > 0
+                  ? 'bg-purple-600 hover:bg-purple-700 text-white cursor-pointer active:scale-98'
+                  : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
+              }`}
+            >
+              <Spline size={13} />
+              <span>Trace to Path Lines</span>
             </button>
           </div>
         )}
@@ -3578,6 +3766,28 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Stroke to Path (Outline Stroke) Quick Inspector Action */}
+              <div className="pt-0.5">
+                <button
+                  type="button"
+                  onClick={() => handleStrokeToPath()}
+                  disabled={selectedElementIds.length === 0}
+                  className={`w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-semibold transition shadow-xs border ${
+                    selectedElementIds.length > 0
+                      ? 'bg-purple-600 hover:bg-purple-700 text-white border-purple-700 cursor-pointer active:scale-98'
+                      : 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                  }`}
+                  title="Trace both sides of the stroke into editable path lines (Ctrl+Shift+O)"
+                >
+                  <Spline size={14} />
+                  <span>Stroke to Path (Outline)</span>
+                </button>
+                <div className="flex justify-between items-center mt-1 text-[10px] text-slate-400 px-0.5">
+                  <span>Traces both sides into paths</span>
+                  <span className="font-mono text-purple-600 font-semibold">Ctrl+Shift+O</span>
+                </div>
+              </div>
+
               {/* Active element closure toggle */}
               {activeSelectedElement && (
                 <div className="flex items-center justify-between bg-slate-50/60 p-2.5 rounded-lg border border-slate-200/80 text-[11px]">
@@ -3890,7 +4100,7 @@ export default function App() {
             </span>
           ) : (
             <span className="hidden md:inline text-[10px] text-slate-400">
-              Middle-click/Wheel: pan canvas | Mouse wheel: zoom | Ctrl+Z / Ctrl+Y: undo/redo
+              Ctrl+Shift+O: stroke to path | Middle-click/Wheel: pan canvas | Mouse wheel: zoom | Ctrl+Z / Ctrl+Y: undo/redo
             </span>
           )}
           <span className="text-[10px] text-slate-400">
