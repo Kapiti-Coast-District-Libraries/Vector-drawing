@@ -27,6 +27,7 @@ import {
   HelpCircle,
   FileImage,
   Undo,
+  Redo,
   Save,
   FolderOpen
 } from 'lucide-react';
@@ -47,7 +48,8 @@ import {
   performPathfinder,
   snapPoint,
   distance,
-  getSegmentCommand
+  getSegmentCommand,
+  snapAngle45
 } from './utils/vector-math';
 import {
   getSpiralTemplate,
@@ -82,6 +84,41 @@ export default function App() {
     }
   ]);
   const [activeLayerId, setActiveLayerId] = useState<string>('layer-1');
+
+  // --- Undo/Redo Stacks & Refs ---
+  const undoStack = useRef<Layer[][]>([]);
+  const redoStack = useRef<Layer[][]>([]);
+  const layersBeforeInteractionRef = useRef<Layer[] | null>(null);
+
+  const pushHistory = (stateToSave: Layer[]) => {
+    const clone = JSON.parse(JSON.stringify(stateToSave));
+    const lastState = undoStack.current[undoStack.current.length - 1];
+    
+    // Only push if different from last state
+    if (!lastState || JSON.stringify(lastState) !== JSON.stringify(clone)) {
+      undoStack.current.push(clone);
+      if (undoStack.current.length > 50) {
+        undoStack.current.shift();
+      }
+      redoStack.current = []; // Clear redo stack on new action
+    }
+  };
+
+  const handleUndo = () => {
+    if (undoStack.current.length === 0) return;
+    const prevState = undoStack.current.pop()!;
+    const currentClone = JSON.parse(JSON.stringify(layers));
+    redoStack.current.push(currentClone);
+    setLayers(prevState);
+  };
+
+  const handleRedo = () => {
+    if (redoStack.current.length === 0) return;
+    const nextState = redoStack.current.pop()!;
+    const currentClone = JSON.parse(JSON.stringify(layers));
+    undoStack.current.push(currentClone);
+    setLayers(nextState);
+  };
 
   // --- Drawing Tool State ---
   const [tool, setTool] = useState<ToolType>('select');
@@ -132,6 +169,7 @@ export default function App() {
   const [isMiddleClickPanning, setIsMiddleClickPanning] = useState<boolean>(false);
   const selectionStartWithShiftRef = useRef<boolean>(false);
   const initialSelectedIdsRef = useRef<string[]>([]);
+  const [activeFlyout, setActiveFlyout] = useState<'pathfinder' | 'mirror' | null>(null);
 
   // --- Resizing / Transforming States ---
   const [isResizing, setIsResizing] = useState<boolean>(false);
@@ -155,6 +193,131 @@ export default function App() {
     dy: 30,
   });
   const currentDragDeltaRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // --- Illustrator-style Modifier Keys and Dynamic States ---
+  const [isCtrlKeyHeld, setIsCtrlKeyHeld] = useState<boolean>(false);
+  const [isAltKeyHeld, setIsAltKeyHeld] = useState<boolean>(false);
+  const [isShiftKeyHeld, setIsShiftKeyHeld] = useState<boolean>(false);
+  const isCtrlHeldRef = useRef<boolean>(false);
+  const isAltHeldRef = useRef<boolean>(false);
+  const isShiftHeldRef = useRef<boolean>(false);
+
+  // --- Click-and-Hold Drag to Size for Shapes ---
+  const [isDrawingShape, setIsDrawingShape] = useState<boolean>(false);
+  const shapeDragStartRef = useRef<Point | null>(null);
+  const activeShapeIdRef = useRef<string | null>(null);
+  const shapeToolTypeRef = useRef<ToolType | null>(null);
+
+  // Helper to calculate shape nodes when dragging to size with Shift (1:1 aspect) and Alt (from center)
+  const updateShapeGeometry = (
+    shapeType: 'rect' | 'ellipse' | 'triangle' | 'spiral',
+    startPt: Point,
+    currentPt: Point,
+    isShift: boolean,
+    isAlt: boolean
+  ): VectorNode[] => {
+    let w = Math.abs(currentPt.x - startPt.x);
+    let h = Math.abs(currentPt.y - startPt.y);
+
+    if (isShift) {
+      const maxDim = Math.max(w, h);
+      w = maxDim;
+      h = maxDim;
+    }
+
+    let x1: number, x2: number, y1: number, y2: number;
+    if (isAlt) {
+      x1 = startPt.x - w;
+      x2 = startPt.x + w;
+      y1 = startPt.y - h;
+      y2 = startPt.y + h;
+    } else {
+      const signX = currentPt.x >= startPt.x ? 1 : -1;
+      const signY = currentPt.y >= startPt.y ? 1 : -1;
+      x1 = signX > 0 ? startPt.x : startPt.x - w;
+      x2 = signX > 0 ? startPt.x + w : startPt.x;
+      y1 = signY > 0 ? startPt.y : startPt.y - h;
+      y2 = signY > 0 ? startPt.y + h : startPt.y;
+    }
+
+    const cx = (x1 + x2) / 2;
+    const cy = (y1 + y2) / 2;
+    const rx = Math.max(1, (x2 - x1) / 2);
+    const ry = Math.max(1, (y2 - y1) / 2);
+
+    if (shapeType === 'rect') {
+      return [
+        { id: 'rn1', anchor: { x: x1, y: y1 }, type: 'corner' },
+        { id: 'rn2', anchor: { x: x2, y: y1 }, type: 'corner' },
+        { id: 'rn3', anchor: { x: x2, y: y2 }, type: 'corner' },
+        { id: 'rn4', anchor: { x: x1, y: y2 }, type: 'corner' },
+      ];
+    } else if (shapeType === 'ellipse') {
+      const kappaX = rx * 0.5522847498;
+      const kappaY = ry * 0.5522847498;
+      return [
+        {
+          id: 'en1',
+          anchor: { x: cx, y: cy - ry },
+          handleIn: { x: cx - kappaX, y: cy - ry },
+          handleOut: { x: cx + kappaX, y: cy - ry },
+          type: 'symmetric',
+        },
+        {
+          id: 'en2',
+          anchor: { x: cx + rx, y: cy },
+          handleIn: { x: cx + rx, y: cy - kappaY },
+          handleOut: { x: cx + rx, y: cy + kappaY },
+          type: 'symmetric',
+        },
+        {
+          id: 'en3',
+          anchor: { x: cx, y: cy + ry },
+          handleIn: { x: cx + kappaX, y: cy + ry },
+          handleOut: { x: cx - kappaX, y: cy + ry },
+          type: 'symmetric',
+        },
+        {
+          id: 'en4',
+          anchor: { x: cx - rx, y: cy },
+          handleIn: { x: cx - rx, y: cy + kappaY },
+          handleOut: { x: cx - rx, y: cy - kappaY },
+          type: 'symmetric',
+        },
+      ];
+    } else if (shapeType === 'triangle') {
+      return [
+        { id: 'tn1', anchor: { x: cx, y: y1 }, type: 'corner' },
+        { id: 'tn2', anchor: { x: x2, y: y2 }, type: 'corner' },
+        { id: 'tn3', anchor: { x: x1, y: y2 }, type: 'corner' },
+      ];
+    } else {
+      // Spiral template rescaled to match bounding box
+      const baseSpiral = getSpiralTemplate();
+      const origBox = getElementBoundingBox(baseSpiral);
+      const scaleX = (x2 - x1) / Math.max(origBox.width, 1);
+      const scaleY = (y2 - y1) / Math.max(origBox.height, 1);
+      return baseSpiral.nodes.map(n => ({
+        ...n,
+        anchor: {
+          x: x1 + (n.anchor.x - origBox.minX) * scaleX,
+          y: y1 + (n.anchor.y - origBox.minY) * scaleY,
+        },
+        handleIn: n.handleIn
+          ? {
+              x: x1 + (n.handleIn.x - origBox.minX) * scaleX,
+              y: y1 + (n.handleIn.y - origBox.minY) * scaleY,
+            }
+          : undefined,
+        handleOut: n.handleOut
+          ? {
+              x: x1 + (n.handleOut.x - origBox.minX) * scaleX,
+              y: y1 + (n.handleOut.y - origBox.minY) * scaleY,
+            }
+          : undefined,
+      }));
+    }
+  };
 
   // --- Drag-over Overlay for file tracing loading ---
   const [isDragOverCanvas, setIsDragOverCanvas] = useState<boolean>(false);
@@ -187,7 +350,10 @@ export default function App() {
   };
 
   // Helper to change property in currently selected path elements
-  const updateSelectedElementsProperty = (key: keyof PathElement, value: any) => {
+  const updateSelectedElementsProperty = (key: keyof PathElement, value: any, saveHistoryState = false) => {
+    if (saveHistoryState) {
+      pushHistory(layers);
+    }
     setLayers(prev =>
       prev.map(layer => ({
         ...layer,
@@ -202,8 +368,11 @@ export default function App() {
   };
 
   // Update properties of a specific node
-  const updateSelectedNodeProperty = (key: keyof VectorNode, value: any) => {
+  const updateSelectedNodeProperty = (key: keyof VectorNode, value: any, saveHistoryState = false) => {
     if (!selectedNodeInfo) return;
+    if (saveHistoryState) {
+      pushHistory(layers);
+    }
     setLayers(prev =>
       prev.map(layer => ({
         ...layer,
@@ -245,6 +414,7 @@ export default function App() {
 
   // --- Adding Starters ---
   const handleLoadTemplate = (type: 'spiral' | 'teardrop' | 'leaf') => {
+    pushHistory(layers);
     let newElements: PathElement[] = [];
     if (type === 'spiral') {
       newElements = [getSpiralTemplate()];
@@ -280,6 +450,7 @@ export default function App() {
       return;
     }
 
+    pushHistory(layers);
     const allEls = getAllElements();
     const selectedEls = allEls.filter(el => selectedElementIds.includes(el.id));
 
@@ -317,6 +488,7 @@ export default function App() {
 
   const handlePaste = () => {
     if (copiedElements.length === 0) return;
+    pushHistory(layers);
     const offset = 24; // offset grid step for copy placement so it is highly visible
     const newPastedElements = copiedElements.map(el => {
       const newNodes = el.nodes.map(node => {
@@ -366,6 +538,7 @@ export default function App() {
     const selectedEls = getAllElements().filter(el => selectedElementIds.includes(el.id));
     if (selectedEls.length === 0) return;
 
+    pushHistory(layers);
     const dx = lastTransform.dx;
     const dy = lastTransform.dy;
 
@@ -418,6 +591,7 @@ export default function App() {
     const selectedEls = getAllElements().filter(el => selectedElementIds.includes(el.id));
     if (selectedEls.length === 0) return;
 
+    pushHistory(layers);
     // Calculate bounding box center of the combined selection
     const box = getCombinedBoundingBox(selectedEls);
 
@@ -532,12 +706,26 @@ export default function App() {
 
     e.preventDefault();
 
+    setActiveFlyout(null);
+
+    // Save starting state for undo/redo
+    layersBeforeInteractionRef.current = JSON.parse(JSON.stringify(layers));
+
     const snappedPt = getSnappedCanvasCoords(e, activePathId || undefined);
 
     // --- TOOL: PEN ---
     if (tool === 'pen') {
+      // Illustrator behavior: Ctrl+Click on empty canvas completes/deselects the active path
+      if (e.ctrlKey || e.metaKey) {
+        setActivePathId(null);
+        setPenPreviewPos(null);
+        setSelectedElementIds([]);
+        setSelectedNodeInfo(null);
+        return;
+      }
+
       if (!activePathId) {
-        // Star a new path!
+        // Start a new path!
         const newPathId = `path-${Math.random().toString(36).substr(2, 9)}`;
         const newNode: VectorNode = {
           id: `node-${Math.random().toString(36).substr(2, 9)}`,
@@ -577,11 +765,18 @@ export default function App() {
         const currentActivePath = getAllElements().find(el => el.id === activePathId);
         if (!currentActivePath) return;
 
+        // Illustrator behavior: holding Shift snaps position in 45-degree increments from last anchor
+        let targetPt = snappedPt;
+        if (currentActivePath.nodes.length > 0 && e.shiftKey) {
+          const lastNode = currentActivePath.nodes[currentActivePath.nodes.length - 1];
+          targetPt = snapAngle45(lastNode.anchor, snappedPt);
+        }
+
         // Check if cursor clicked the first node to close the path
         if (currentActivePath.nodes.length > 2) {
           const firstNode = currentActivePath.nodes[0];
-          const distToFirst = distance(snappedPt, firstNode.anchor);
-          if (distToFirst < 12 / zoom) {
+          const distToFirst = distance(targetPt, firstNode.anchor);
+          if (distToFirst < 14 / zoom) {
             // Close path and finish!
             setLayers(prev =>
               prev.map(layer => ({
@@ -602,7 +797,7 @@ export default function App() {
         const newNodeId = `node-${Math.random().toString(36).substr(2, 9)}`;
         const newNode: VectorNode = {
           id: newNodeId,
-          anchor: snappedPt,
+          anchor: targetPt,
           type: 'smooth'
         };
 
@@ -624,115 +819,35 @@ export default function App() {
       return;
     }
 
-    // --- TOOL: RECTANGLE / ELLIPSE / TRIANGLE / SPIRAL FAST-GENS ---
+    // --- TOOL: RECTANGLE / ELLIPSE / TRIANGLE / SPIRAL (Click and drag to size) ---
     if (tool === 'rect' || tool === 'ellipse' || tool === 'triangle' || tool === 'spiral') {
       const elId = `shape-${Math.random().toString(36).substr(2, 9)}`;
-      let newElement: PathElement;
+      const initialNodes = updateShapeGeometry(
+        tool,
+        snappedPt,
+        snappedPt,
+        e.shiftKey,
+        e.altKey
+      );
 
-      if (tool === 'rect') {
-        const side = 60;
-        newElement = {
-          id: elId,
-          name: 'Rectangle',
-          type: 'rect',
-          nodes: [
-            { id: 'rn1', anchor: { x: snappedPt.x - side, y: snappedPt.y - side }, type: 'corner' },
-            { id: 'rn2', anchor: { x: snappedPt.x + side, y: snappedPt.y - side }, type: 'corner' },
-            { id: 'rn3', anchor: { x: snappedPt.x + side, y: snappedPt.y + side }, type: 'corner' },
-            { id: 'rn4', anchor: { x: snappedPt.x - side, y: snappedPt.y + side }, type: 'corner' },
-          ],
-          closed: true,
-          fill: fillColor,
-          fillOpacity: fillOpacity,
-          stroke: strokeColor,
-          strokeWidth: strokeWidth,
-          visible: true,
-          locked: false,
-        };
-      } else if (tool === 'ellipse') {
-        // Perfect 4-node bezier circle
-        const r = 50;
-        const kappa = r * 0.5522847498; // bezier circle magic multiplier
-        const center = snappedPt;
-        newElement = {
-          id: elId,
-          name: 'Ellipse',
-          type: 'ellipse',
-          nodes: [
-            {
-              id: 'en1',
-              anchor: { x: center.x, y: center.y - r },
-              handleIn: { x: center.x - kappa, y: center.y - r },
-              handleOut: { x: center.x + kappa, y: center.y - r },
-              type: 'symmetric',
-            },
-            {
-              id: 'en2',
-              anchor: { x: center.x + r, y: center.y },
-              handleIn: { x: center.x + r, y: center.y - kappa },
-              handleOut: { x: center.x + r, y: center.y + kappa },
-              type: 'symmetric',
-            },
-            {
-              id: 'en3',
-              anchor: { x: center.x, y: center.y + r },
-              handleIn: { x: center.x + kappa, y: center.y + r },
-              handleOut: { x: center.x - kappa, y: center.y + r },
-              type: 'symmetric',
-            },
-            {
-              id: 'en4',
-              anchor: { x: center.x - r, y: center.y },
-              handleIn: { x: center.x - r, y: center.y + kappa },
-              handleOut: { x: center.x - r, y: center.y - kappa },
-              type: 'symmetric',
-            },
-          ],
-          closed: true,
-          fill: fillColor,
-          fillOpacity: fillOpacity,
-          stroke: strokeColor,
-          strokeWidth: strokeWidth,
-          visible: true,
-          locked: false,
-        };
-      } else if (tool === 'triangle') {
-        newElement = {
-          id: elId,
-          name: 'Triangle',
-          type: 'polygon',
-          nodes: [
-            { id: `tn1-${Math.random().toString(36).substr(2, 5)}`, anchor: { x: snappedPt.x, y: snappedPt.y - 50 }, type: 'corner' },
-            { id: `tn2-${Math.random().toString(36).substr(2, 5)}`, anchor: { x: snappedPt.x + 50, y: snappedPt.y + 40 }, type: 'corner' },
-            { id: `tn3-${Math.random().toString(36).substr(2, 5)}`, anchor: { x: snappedPt.x - 50, y: snappedPt.y + 40 }, type: 'corner' },
-          ],
-          closed: true,
-          fill: fillColor,
-          fillOpacity: fillOpacity,
-          stroke: strokeColor,
-          strokeWidth: strokeWidth,
-          visible: true,
-          locked: false,
-        };
-      } else {
-        // Fast Spiral stamp node offset
-        const baseSpiral = getSpiralTemplate();
-        const shiftedNodes = baseSpiral.nodes.map(n => ({
-          ...n,
-          anchor: { x: n.anchor.x + (snappedPt.x - 200), y: n.anchor.y + (snappedPt.y - 250) },
-          handleIn: n.handleIn ? { x: n.handleIn.x + (snappedPt.x - 200), y: n.handleIn.y + (snappedPt.y - 250) } : undefined,
-          handleOut: n.handleOut ? { x: n.handleOut.x + (snappedPt.x - 200), y: n.handleOut.y + (snappedPt.y - 250) } : undefined,
-        }));
+      const shapeName =
+        tool === 'rect' ? 'Rectangle' :
+        tool === 'ellipse' ? 'Ellipse' :
+        tool === 'triangle' ? 'Triangle' : 'Spiral';
 
-        newElement = {
-          ...baseSpiral,
-          id: elId,
-          nodes: shiftedNodes,
-          fill: fillColor,
-          stroke: strokeColor,
-          strokeWidth: strokeWidth,
-        };
-      }
+      const newElement: PathElement = {
+        id: elId,
+        name: shapeName,
+        type: tool === 'triangle' ? 'polygon' : tool,
+        nodes: initialNodes,
+        closed: true,
+        fill: fillColor,
+        fillOpacity: fillOpacity,
+        stroke: strokeColor,
+        strokeWidth: strokeWidth,
+        visible: true,
+        locked: false,
+      };
 
       setLayers(prev =>
         prev.map(layer =>
@@ -742,8 +857,11 @@ export default function App() {
         )
       );
 
+      setIsDrawingShape(true);
+      activeShapeIdRef.current = elId;
+      shapeDragStartRef.current = snappedPt;
+      shapeToolTypeRef.current = tool;
       setSelectedElementIds([elId]);
-      setTool('select');
       return;
     }
 
@@ -884,7 +1002,41 @@ export default function App() {
 
     // Update coordinates showing in pen mode visual guide
     if (activePathId) {
-      setPenPreviewPos(snappedPos);
+      let preview = snappedPos;
+      if (e.shiftKey) {
+        const currentActivePath = getAllElements().find(el => el.id === activePathId);
+        if (currentActivePath && currentActivePath.nodes.length > 0) {
+          const lastNode = currentActivePath.nodes[currentActivePath.nodes.length - 1];
+          preview = snapAngle45(lastNode.anchor, snappedPos);
+        }
+      }
+      setPenPreviewPos(preview);
+    }
+
+    // --- CASE SHAPE DRAG: Sizing shape interactively on drag ---
+    if (isDrawingShape && activeShapeIdRef.current && shapeDragStartRef.current && shapeToolTypeRef.current) {
+      const currentPos = snappedPos;
+      const startPos = shapeDragStartRef.current;
+      const shapeType = shapeToolTypeRef.current as 'rect' | 'ellipse' | 'triangle' | 'spiral';
+      const updatedNodes = updateShapeGeometry(
+        shapeType,
+        startPos,
+        currentPos,
+        e.shiftKey,
+        e.altKey
+      );
+
+      setLayers(prev =>
+        prev.map(layer => ({
+          ...layer,
+          elements: layer.elements.map(el =>
+            el.id === activeShapeIdRef.current
+              ? { ...el, nodes: updatedNodes }
+              : el
+          ),
+        }))
+      );
+      return;
     }
 
     // --- CASE 1: Drawing curves interactively while laying Pen Nodes (drag out handles in real time!) ---
@@ -900,12 +1052,28 @@ export default function App() {
                 ...el,
                 nodes: el.nodes.map(node => {
                   if (node.id === nodeId) {
-                    const dx = rawPos.x - node.anchor.x;
-                    const dy = rawPos.y - node.anchor.y;
+                    // Illustrator behavior: holding Shift snaps handle angle in 45-degree increments
+                    let targetPos = rawPos;
+                    if (e.shiftKey) {
+                      targetPos = snapAngle45(node.anchor, rawPos);
+                    }
+
+                    const dx = targetPos.x - node.anchor.x;
+                    const dy = targetPos.y - node.anchor.y;
 
                     // handleOut follows mouse
-                    const handleOut = { x: rawPos.x, y: rawPos.y };
-                    // handleIn goes symmetric opposite way
+                    const handleOut = { x: targetPos.x, y: targetPos.y };
+
+                    // Illustrator behavior: holding Alt breaks symmetry so handleIn is unchanged!
+                    if (e.altKey) {
+                      return {
+                        ...node,
+                        handleOut,
+                        type: 'corner',
+                      };
+                    }
+
+                    // Symmetric handleIn
                     const handleIn = { x: node.anchor.x - dx, y: node.anchor.y - dy };
 
                     return {
@@ -989,7 +1157,7 @@ export default function App() {
     }
 
     // --- CASE 2: Dragging selected anchor point or bezier handle (Node Editor) ---
-    if (tool === 'direct-select' && isDragging && selectedNodeInfo && selectedHandle) {
+    if ((tool === 'direct-select' || tool === 'pen') && isDragging && selectedNodeInfo && selectedHandle) {
       const { elementId, nodeId } = selectedNodeInfo;
 
       setLayers(prev =>
@@ -1003,9 +1171,13 @@ export default function App() {
                   if (node.id === nodeId) {
                     if (selectedHandle === 'anchor') {
                       // Move Anchor: compute delta movement
+                      let targetAnchor = snappedPos;
+                      if (e.shiftKey) {
+                        targetAnchor = snapAngle45(dragStartCanvasPos, snappedPos);
+                      }
                       const prevAnchor = node.anchor;
-                      const dx = snappedPos.x - prevAnchor.x;
-                      const dy = snappedPos.y - prevAnchor.y;
+                      const dx = targetAnchor.x - prevAnchor.x;
+                      const dy = targetAnchor.y - prevAnchor.y;
 
                       // Move handles in unison with anchor
                       const updatedHandleIn = node.handleIn
@@ -1017,21 +1189,24 @@ export default function App() {
 
                       return {
                         ...node,
-                        anchor: snappedPos,
+                        anchor: targetAnchor,
                         handleIn: updatedHandleIn,
                         handleOut: updatedHandleOut,
                       };
                     } else if (selectedHandle === 'handleOut') {
                       // Adjust Handle OUT
-                      const handleOut = rawPos; // handles ignore node snapping for micro curvature control
+                      let handleOut = rawPos;
+                      if (e.shiftKey) {
+                        handleOut = snapAngle45(node.anchor, rawPos);
+                      }
                       const dx = handleOut.x - node.anchor.x;
                       const dy = handleOut.y - node.anchor.y;
 
                       let updateIn = node.handleIn;
-                      if (node.type === 'symmetric') {
+                      if (!e.altKey && node.type === 'symmetric') {
                         // Symmetric: mirror direction and distance
                         updateIn = { x: node.anchor.x - dx, y: node.anchor.y - dy };
-                      } else if (node.type === 'smooth' && node.handleIn) {
+                      } else if (!e.altKey && node.type === 'smooth' && node.handleIn) {
                         // Smooth: mirror direction but keep own original scale
                         const distIn = distance(node.anchor, node.handleIn);
                         const angle = Math.atan2(dy, dx) + Math.PI;
@@ -1041,17 +1216,25 @@ export default function App() {
                         };
                       }
 
-                      return { ...node, handleOut, handleIn: updateIn };
+                      return {
+                        ...node,
+                        handleOut,
+                        handleIn: updateIn,
+                        type: e.altKey ? 'corner' : node.type,
+                      };
                     } else if (selectedHandle === 'handleIn') {
                       // Adjust Handle IN
-                      const handleIn = rawPos;
+                      let handleIn = rawPos;
+                      if (e.shiftKey) {
+                        handleIn = snapAngle45(node.anchor, rawPos);
+                      }
                       const dx = handleIn.x - node.anchor.x;
                       const dy = handleIn.y - node.anchor.y;
 
                       let updateOut = node.handleOut;
-                      if (node.type === 'symmetric') {
+                      if (!e.altKey && node.type === 'symmetric') {
                         updateOut = { x: node.anchor.x - dx, y: node.anchor.y - dy };
-                      } else if (node.type === 'smooth' && node.handleOut) {
+                      } else if (!e.altKey && node.type === 'smooth' && node.handleOut) {
                         const distOut = distance(node.anchor, node.handleOut);
                         const angle = Math.atan2(dy, dx) + Math.PI;
                         updateOut = {
@@ -1060,7 +1243,12 @@ export default function App() {
                         };
                       }
 
-                      return { ...node, handleIn, handleOut: updateOut };
+                      return {
+                        ...node,
+                        handleIn,
+                        handleOut: updateOut,
+                        type: e.altKey ? 'corner' : node.type,
+                      };
                     }
                   }
                   return node;
@@ -1390,6 +1578,50 @@ export default function App() {
   };
 
   const handleCanvasMouseUp = () => {
+    // Check if dragging to create shape is active and finalize it
+    if (isDrawingShape && activeShapeIdRef.current && shapeDragStartRef.current && shapeToolTypeRef.current) {
+      const startPos = shapeDragStartRef.current;
+      const el = getAllElements().find(v => v.id === activeShapeIdRef.current);
+      if (el) {
+        const box = getElementBoundingBox(el);
+        // If the user just clicked without dragging (tiny box < 6px), generate standard 80x80 shape
+        if (box.width < 6 && box.height < 6) {
+          const defaultSize = 80;
+          const defaultNodes = updateShapeGeometry(
+            shapeToolTypeRef.current as any,
+            { x: startPos.x - defaultSize / 2, y: startPos.y - defaultSize / 2 },
+            { x: startPos.x + defaultSize / 2, y: startPos.y + defaultSize / 2 },
+            false,
+            false
+          );
+          setLayers(prev =>
+            prev.map(layer => ({
+              ...layer,
+              elements: layer.elements.map(item =>
+                item.id === activeShapeIdRef.current
+                  ? { ...item, nodes: defaultNodes }
+                  : item
+              ),
+            }))
+          );
+        }
+      }
+
+      setIsDrawingShape(false);
+      activeShapeIdRef.current = null;
+      shapeDragStartRef.current = null;
+      shapeToolTypeRef.current = null;
+      setTool('select');
+    }
+
+    // Check if layers changed during interaction and save starting state to undo stack
+    if (layersBeforeInteractionRef.current) {
+      if (JSON.stringify(layers) !== JSON.stringify(layersBeforeInteractionRef.current)) {
+        pushHistory(layersBeforeInteractionRef.current);
+      }
+      layersBeforeInteractionRef.current = null;
+    }
+
     if (tool === 'select' && isDragging && selectedElementIds.length > 0) {
       const delta = currentDragDeltaRef.current;
       if (Math.abs(delta.x) > 0.5 || Math.abs(delta.y) > 0.5) {
@@ -1413,30 +1645,89 @@ export default function App() {
     setSelectionBox(null);
   };
 
-  // --- DOUBLE CLICK TO SHARPEN / SMOOTH NODE CONVERSION ---
+  // --- DOUBLE CLICK TO TOGGLE SMOOTH / CORNER NODE CONVERSION (ILLUSTRATOR STYLE) ---
   const handleSharpenNode = (elementId: string, nodeId: string) => {
+    pushHistory(layers);
     setLayers(prev =>
       prev.map(layer => ({
         ...layer,
         elements: layer.elements.map(el => {
           if (el.id === elementId) {
-            return {
-              ...el,
-              nodes: el.nodes.map(n => {
-                if (n.id === nodeId) {
-                  return {
-                    ...n,
-                    handleIn: undefined,
-                    handleOut: undefined,
-                    type: 'corner'
-                  };
-                }
-                return n;
-              })
-            };
+            const nodeIdx = el.nodes.findIndex(n => n.id === nodeId);
+            if (nodeIdx === -1) return el;
+            const node = el.nodes[nodeIdx];
+
+            const hasHandles = !!(node.handleIn || node.handleOut);
+            if (hasHandles) {
+              // Smooth -> Corner: remove handles
+              return {
+                ...el,
+                nodes: el.nodes.map(n =>
+                  n.id === nodeId
+                    ? { ...n, handleIn: undefined, handleOut: undefined, type: 'corner' }
+                    : n
+                ),
+              };
+            } else {
+              // Corner -> Smooth: calculate smooth tangent handles from neighboring nodes
+              const prevNode = nodeIdx > 0
+                ? el.nodes[nodeIdx - 1]
+                : el.closed && el.nodes.length > 2 ? el.nodes[el.nodes.length - 1] : null;
+              const nextNode = nodeIdx < el.nodes.length - 1
+                ? el.nodes[nodeIdx + 1]
+                : el.closed && el.nodes.length > 2 ? el.nodes[0] : null;
+
+              let handleIn: Point | undefined = undefined;
+              let handleOut: Point | undefined = undefined;
+
+              if (prevNode && nextNode) {
+                const dx = nextNode.anchor.x - prevNode.anchor.x;
+                const dy = nextNode.anchor.y - prevNode.anchor.y;
+                const len = Math.hypot(dx, dy) || 1;
+                const d1 = distance(node.anchor, prevNode.anchor);
+                const d2 = distance(node.anchor, nextNode.anchor);
+                const handleLen = Math.max(15, Math.min(d1, d2) * 0.35);
+
+                const ux = (dx / len) * handleLen;
+                const uy = (dy / len) * handleLen;
+
+                handleIn = { x: node.anchor.x - ux, y: node.anchor.y - uy };
+                handleOut = { x: node.anchor.x + ux, y: node.anchor.y + uy };
+              } else if (nextNode) {
+                const dx = nextNode.anchor.x - node.anchor.x;
+                const dy = nextNode.anchor.y - node.anchor.y;
+                const len = Math.hypot(dx, dy) || 1;
+                const handleLen = Math.max(15, len * 0.35);
+                const ux = (dx / len) * handleLen;
+                const uy = (dy / len) * handleLen;
+                handleOut = { x: node.anchor.x + ux, y: node.anchor.y + uy };
+                handleIn = { x: node.anchor.x - ux, y: node.anchor.y - uy };
+              } else if (prevNode) {
+                const dx = node.anchor.x - prevNode.anchor.x;
+                const dy = node.anchor.y - prevNode.anchor.y;
+                const len = Math.hypot(dx, dy) || 1;
+                const handleLen = Math.max(15, len * 0.35);
+                const ux = (dx / len) * handleLen;
+                const uy = (dy / len) * handleLen;
+                handleIn = { x: node.anchor.x - ux, y: node.anchor.y - uy };
+                handleOut = { x: node.anchor.x + ux, y: node.anchor.y + uy };
+              } else {
+                handleIn = { x: node.anchor.x - 30, y: node.anchor.y };
+                handleOut = { x: node.anchor.x + 30, y: node.anchor.y };
+              }
+
+              return {
+                ...el,
+                nodes: el.nodes.map(n =>
+                  n.id === nodeId
+                    ? { ...n, handleIn, handleOut, type: 'smooth' }
+                    : n
+                ),
+              };
+            }
           }
           return el;
-        })
+        }),
       }))
     );
   };
@@ -1449,8 +1740,13 @@ export default function App() {
     fromNode: VectorNode,
     toNode: VectorNode
   ) => {
+    if (e.button === 1) return; // Allow middle-click to bubble to canvas for panning
+    if (e.button !== 0) return; // Only left-click starts dragging
+
+    // Save starting state for undo/redo
+    layersBeforeInteractionRef.current = JSON.parse(JSON.stringify(layers));
+
     e.stopPropagation();
-    if (e.button !== 0) return; // Only left click
 
     // Ensure we are in direct-select tool to bend curves
     if (tool !== 'direct-select') {
@@ -1497,13 +1793,108 @@ export default function App() {
     nodeId: string,
     handleType: 'anchor' | 'handleIn' | 'handleOut'
   ) => {
+    if (e.button === 1) return; // Allow middle-click to bubble to canvas for panning
+    if (e.button !== 0) return; // Only left-click starts dragging
+
+    // Save starting state for undo/redo
+    layersBeforeInteractionRef.current = JSON.parse(JSON.stringify(layers));
+
     e.stopPropagation(); // prevent background canvas drags
+
+    // Illustrator behavior: Ctrl/Cmd + click directly selects node without exiting Pen tool
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedElementIds([elementId]);
+      setSelectedNodeInfo({ elementId, nodeId });
+      setSelectedHandle(handleType);
+      setIsDragging(true);
+      const raw = getCanvasCoords(e as any);
+      setDragStartCanvasPos({ x: raw.x, y: raw.y });
+      return;
+    }
+
+    // Illustrator behavior: Alt + click converts anchor (retracts handles if present, or prepares to drag new handles)
+    if (tool === 'pen' && e.altKey) {
+      if (handleType === 'anchor') {
+        const el = getAllElements().find(item => item.id === elementId);
+        const targetNode = el?.nodes.find(n => n.id === nodeId);
+        if (targetNode) {
+          if (targetNode.handleIn || targetNode.handleOut) {
+            setLayers(prev =>
+              prev.map(layer => ({
+                ...layer,
+                elements: layer.elements.map(item =>
+                  item.id === elementId
+                    ? {
+                        ...item,
+                        nodes: item.nodes.map(n =>
+                          n.id === nodeId
+                            ? { ...n, handleIn: undefined, handleOut: undefined, type: 'corner' }
+                            : n
+                        ),
+                      }
+                    : item
+                ),
+              }))
+            );
+          }
+          setSelectedElementIds([elementId]);
+          setSelectedNodeInfo({ elementId, nodeId });
+          setSelectedHandle('handleOut');
+          setIsDrawingDrag(true);
+          return;
+        }
+      } else if (handleType === 'handleIn' || handleType === 'handleOut') {
+        // Alt-dragging an existing handle converts anchor to corner and moves that handle independently
+        setSelectedElementIds([elementId]);
+        setSelectedNodeInfo({ elementId, nodeId });
+        setSelectedHandle(handleType);
+        setIsDragging(true);
+        const raw = getCanvasCoords(e as any);
+        setDragStartCanvasPos({ x: raw.x, y: raw.y });
+        setLayers(prev =>
+          prev.map(layer => ({
+            ...layer,
+            elements: layer.elements.map(item =>
+              item.id === elementId
+                ? {
+                    ...item,
+                    nodes: item.nodes.map(n =>
+                      n.id === nodeId ? { ...n, type: 'corner' } : n
+                    ),
+                  }
+                : item
+            ),
+          }))
+        );
+        return;
+      }
+    }
 
     if (tool === 'pen') {
       const el = getAllElements().find(item => item.id === elementId);
       if (el && !el.closed) {
         const isStartNode = el.nodes[0].id === nodeId;
         const isEndNode = el.nodes[el.nodes.length - 1].id === nodeId;
+
+        // If clicking last anchor of active path without Alt, retract handleOut so next segment is sharp!
+        if (activePathId === elementId && isEndNode && handleType === 'anchor') {
+          setLayers(prev =>
+            prev.map(layer => ({
+              ...layer,
+              elements: layer.elements.map(item =>
+                item.id === elementId
+                  ? {
+                      ...item,
+                      nodes: item.nodes.map(n =>
+                        n.id === nodeId ? { ...n, handleOut: undefined, type: 'corner' } : n
+                      ),
+                    }
+                  : item
+              ),
+            }))
+          );
+          return;
+        }
 
         if (isStartNode || isEndNode) {
           // If we clicked the start node of the ACTIVE path, close it!
@@ -1571,11 +1962,25 @@ export default function App() {
 
   // --- DETECT ELEMENT ENTIRE OUTLINE CLICK FOR SELECTING/TRANSFORMING ---
   const handleElementMouseDown = (e: React.MouseEvent, elementId: string) => {
+    if (e.button === 1) return; // Allow middle-click to bubble to canvas for panning
+    if (e.button !== 0) return; // Only left-click starts dragging
+
+    // Save starting state for undo/redo
+    layersBeforeInteractionRef.current = JSON.parse(JSON.stringify(layers));
+
     e.stopPropagation();
     e.preventDefault();
 
+    setActiveFlyout(null);
+
     const el = getAllElements().find(v => v.id === elementId);
     if (el?.locked) return; // locked elements cannot be interacted with
+
+    // Illustrator behavior: Ctrl/Cmd + click selects element without restarting pen path
+    if (tool === 'pen' && (e.ctrlKey || e.metaKey)) {
+      setSelectedElementIds([elementId]);
+      return;
+    }
 
     if (tool === 'pen') {
       if (el && !el.closed) {
@@ -1715,6 +2120,7 @@ export default function App() {
 
   // --- Layer operations ---
   const handleAddLayer = () => {
+    pushHistory(layers);
     const newId = `layer-${Date.now()}`;
     const newLayer: Layer = {
       id: newId,
@@ -1732,6 +2138,7 @@ export default function App() {
       alert("Kia wātea kia kotahi te paparanga (Must keep at least one paint layer active).");
       return;
     }
+    pushHistory(layers);
     setLayers(prev => prev.filter(l => l.id !== layerId));
     if (activeLayerId === layerId) {
       const remaining = layers.filter(l => l.id !== layerId);
@@ -1755,6 +2162,7 @@ export default function App() {
     const newIdx = dir === 'up' ? index - 1 : index + 1;
     if (newIdx < 0 || newIdx >= layers.length) return;
 
+    pushHistory(layers);
     const updated = [...layers];
     const [moved] = updated.splice(index, 1);
     updated.splice(newIdx, 0, moved);
@@ -1815,9 +2223,22 @@ export default function App() {
     setPenPreviewPos(null);
   };
 
-  // Delete key stroke to instantly delete selected nodes or elements
+  // Delete key stroke to instantly delete selected nodes or elements & modifier key tracking
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Control' || e.key === 'Meta') {
+        isCtrlHeldRef.current = true;
+        setIsCtrlKeyHeld(true);
+      }
+      if (e.key === 'Alt') {
+        isAltHeldRef.current = true;
+        setIsAltKeyHeld(true);
+      }
+      if (e.key === 'Shift') {
+        isShiftHeldRef.current = true;
+        setIsShiftKeyHeld(true);
+      }
+
       if (document.activeElement?.tagName === 'INPUT') return;
 
       const isModKey = e.ctrlKey || e.metaKey;
@@ -1831,9 +2252,16 @@ export default function App() {
       } else if (isModKey && (e.key === 'd' || e.key === 'D')) {
         e.preventDefault();
         handleRepeatTransform();
+      } else if (isModKey && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
+        e.preventDefault();
+        handleUndo();
+      } else if (isModKey && (e.key === 'y' || e.key === 'Y' || (e.shiftKey && (e.key === 'z' || e.key === 'Z')))) {
+        e.preventDefault();
+        handleRedo();
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedNodeInfo && tool === 'direct-select') {
           // Delete selected node
+          pushHistory(layers);
           const { elementId, nodeId } = selectedNodeInfo;
           setLayers(prev =>
             prev.map(layer => ({
@@ -1852,6 +2280,7 @@ export default function App() {
           setSelectedNodeInfo(null);
         } else if (selectedElementIds.length > 0) {
           // Delete selected key elements
+          pushHistory(layers);
           setLayers(prev =>
             prev.map(layer => ({
               ...layer,
@@ -1890,8 +2319,38 @@ export default function App() {
       }
     };
 
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Control' || e.key === 'Meta') {
+        isCtrlHeldRef.current = false;
+        setIsCtrlKeyHeld(false);
+      }
+      if (e.key === 'Alt') {
+        isAltHeldRef.current = false;
+        setIsAltKeyHeld(false);
+      }
+      if (e.key === 'Shift') {
+        isShiftHeldRef.current = false;
+        setIsShiftKeyHeld(false);
+      }
+    };
+
+    const handleWindowBlur = () => {
+      isCtrlHeldRef.current = false;
+      setIsCtrlKeyHeld(false);
+      isAltHeldRef.current = false;
+      setIsAltKeyHeld(false);
+      isShiftHeldRef.current = false;
+      setIsShiftKeyHeld(false);
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleWindowBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleWindowBlur);
+    };
   }, [selectedElementIds, selectedNodeInfo, activePathId, tool, copiedElements, layers, activeLayerId, lastTransform]);
 
   // --- MOUSE WHEEL ZOOM ON CANVAS ---
@@ -2108,6 +2567,38 @@ export default function App() {
             className="hidden"
           />
 
+          <div className="h-6 w-[1px] bg-slate-200 my-auto mx-0.5"></div>
+
+          {/* Undo Button */}
+          <button
+            onClick={handleUndo}
+            disabled={undoStack.current.length === 0}
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg font-semibold text-xs transition shadow-sm border ${
+              undoStack.current.length > 0
+                ? 'bg-white hover:bg-slate-50 border-slate-200 text-slate-700 hover:text-slate-900 cursor-pointer'
+                : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed'
+            }`}
+            title="MahiWhakatika-Whakahoki - Undo Last Action (Ctrl+Z)"
+          >
+            <Undo size={14} />
+            Undo
+          </button>
+
+          {/* Redo Button */}
+          <button
+            onClick={handleRedo}
+            disabled={redoStack.current.length === 0}
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg font-semibold text-xs transition shadow-sm border ${
+              redoStack.current.length > 0
+                ? 'bg-white hover:bg-slate-50 border-slate-200 text-slate-700 hover:text-slate-900 cursor-pointer'
+                : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed'
+            }`}
+            title="MahiWhakatika-Taurua - Redo Last Action (Ctrl+Y or Ctrl+Shift+Z)"
+          >
+            <Redo size={14} />
+            Redo
+          </button>
+
           <div className="h-6 w-[1px] bg-slate-200 my-auto mx-1"></div>
 
           <button
@@ -2169,7 +2660,7 @@ export default function App() {
         )}
 
         {/* --- Left Tool Rail (Drawing Tools) --- */}
-        <div className="w-16 bg-white border-r border-slate-200/80 flex flex-col items-center py-4 gap-2 z-30 select-none">
+        <div className="w-16 bg-white border-r border-slate-200/80 flex flex-col items-center py-4 gap-2 z-30 select-none overflow-y-auto max-h-full scrollbar-none">
           <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-2">Tools</div>
 
           <button
@@ -2285,7 +2776,50 @@ export default function App() {
             </span>
           </button>
 
-          <div className="flex-1"></div>
+          <div className="w-8 h-[1px] bg-slate-200 my-2"></div>
+
+          <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1">Actions</div>
+
+          {/* Pathfinder Flyout Button */}
+          <button
+            onClick={() => setActiveFlyout(prev => prev === 'pathfinder' ? null : 'pathfinder')}
+            className={`p-3 rounded-lg transition relative group ${
+              activeFlyout === 'pathfinder'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : selectedElementIds.length >= 2
+                ? 'bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-100'
+                : 'text-slate-300 hover:bg-slate-50'
+            }`}
+            title="Pathfinder Operations (Union, Subtract, Intersect, Exclude)"
+          >
+            <svg className="w-[18px] h-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="9" cy="12" r="6" fill="currentColor" fillOpacity={activeFlyout === 'pathfinder' ? 0.3 : 0.1} />
+              <circle cx="15" cy="12" r="6" fill="currentColor" fillOpacity={activeFlyout === 'pathfinder' ? 0.5 : 0.25} />
+            </svg>
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              Boolean Pathfinder {selectedElementIds.length < 2 ? '(Select 2+ shapes)' : ''}
+            </span>
+          </button>
+
+          {/* Mirror & Symmetry Flyout Button */}
+          <button
+            onClick={() => setActiveFlyout(prev => prev === 'mirror' ? null : 'mirror')}
+            className={`p-3 rounded-lg transition relative group ${
+              activeFlyout === 'mirror'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : selectedElementIds.length > 0
+                ? 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100 border border-emerald-100'
+                : 'text-slate-300 hover:bg-slate-50'
+            }`}
+            title="Mirror & Symmetry Actions"
+          >
+            <Compass size={18} className={selectedElementIds.length > 0 ? "animate-spin-slow" : ""} />
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              Mirror & Symmetry {selectedElementIds.length === 0 ? '(Select 1+ shapes)' : ''}
+            </span>
+          </button>
+
+          <div className="flex-1 min-h-[20px]"></div>
 
           {/* Canvas Controls */}
           <div className="w-8 h-[1px] bg-slate-200 my-2"></div>
@@ -2314,6 +2848,169 @@ export default function App() {
             </button>
           </div>
         </div>
+
+        {/* --- Floating Submenus / Flyouts (placed as sibling outside the scrollable parent to prevent overflow clipping) --- */}
+        {activeFlyout === 'pathfinder' && (
+          <div className="absolute left-16 top-[410px] w-56 bg-white border border-slate-200 rounded-lg shadow-xl py-2 z-50 animate-in fade-in slide-in-from-left-2 duration-150">
+            <div className="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100 pb-1.5 mb-1.5 flex justify-between items-center">
+              <span>Boolean Pathfinder</span>
+              {selectedElementIds.length >= 2 ? (
+                <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-600">
+                  {selectedElementIds.length} Shapes
+                </span>
+              ) : (
+                <span className="text-[9px] text-amber-500 font-medium">Select 2+ shapes</span>
+              )}
+            </div>
+            <button
+              onClick={() => {
+                if (selectedElementIds.length >= 2) {
+                  handlePathfinder('union');
+                  setActiveFlyout(null);
+                }
+              }}
+              disabled={selectedElementIds.length < 2}
+              className={`w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition ${
+                selectedElementIds.length >= 2 ? 'hover:bg-slate-50 text-slate-700 cursor-pointer' : 'text-slate-300 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <svg className={`w-4 h-4 ${selectedElementIds.length >= 2 ? 'text-blue-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+                <rect x="11" y="3" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+              </svg>
+              <span className="font-medium">Union (Combine)</span>
+            </button>
+            <button
+              onClick={() => {
+                if (selectedElementIds.length >= 2) {
+                  handlePathfinder('subtract');
+                  setActiveFlyout(null);
+                }
+              }}
+              disabled={selectedElementIds.length < 2}
+              className={`w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition ${
+                selectedElementIds.length >= 2 ? 'hover:bg-slate-50 text-slate-700 cursor-pointer' : 'text-slate-300 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <svg className={`w-4 h-4 ${selectedElementIds.length >= 2 ? 'text-red-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+                <rect x="11" y="3" width="10" height="10" rx="1.5" fill="none" strokeDasharray="3 3" />
+              </svg>
+              <span className="font-medium">Subtract (Carve)</span>
+            </button>
+            <button
+              onClick={() => {
+                if (selectedElementIds.length >= 2) {
+                  handlePathfinder('intersect');
+                  setActiveFlyout(null);
+                }
+              }}
+              disabled={selectedElementIds.length < 2}
+              className={`w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition ${
+                selectedElementIds.length >= 2 ? 'hover:bg-slate-50 text-slate-700 cursor-pointer' : 'text-slate-300 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <svg className={`w-4 h-4 ${selectedElementIds.length >= 2 ? 'text-emerald-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="11" width="10" height="10" rx="1.5" fill="none" />
+                <rect x="11" y="3" width="10" height="10" rx="1.5" fill="none" />
+                <rect x="11" y="11" width="2" height="2" fill="currentColor" fillOpacity="0.4" />
+              </svg>
+              <span className="font-medium">Intersect</span>
+            </button>
+            <button
+              onClick={() => {
+                if (selectedElementIds.length >= 2) {
+                  handlePathfinder('exclude');
+                  setActiveFlyout(null);
+                }
+              }}
+              disabled={selectedElementIds.length < 2}
+              className={`w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition ${
+                selectedElementIds.length >= 2 ? 'hover:bg-slate-50 text-slate-700 cursor-pointer' : 'text-slate-300 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <svg className={`w-4 h-4 ${selectedElementIds.length >= 2 ? 'text-amber-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+                <rect x="11" y="3" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
+              </svg>
+              <span className="font-medium">Exclude (XOR)</span>
+            </button>
+          </div>
+        )}
+
+        {activeFlyout === 'mirror' && (
+          <div className="absolute left-16 top-[450px] w-56 bg-white border border-slate-200 rounded-lg shadow-xl py-2 z-50 animate-in fade-in slide-in-from-left-2 duration-150">
+            <div className="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100 pb-1.5 mb-1.5">
+              Flip & Symmetry
+            </div>
+            
+            <div className="px-3 py-1 text-[9px] font-bold text-slate-400 uppercase tracking-wider">Flip Selected</div>
+            <button
+              onClick={() => {
+                if (selectedElementIds.length > 0) {
+                  handleMirrorAction('flip-horizontal');
+                  setActiveFlyout(null);
+                }
+              }}
+              disabled={selectedElementIds.length === 0}
+              className={`w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition ${
+                selectedElementIds.length > 0 ? 'hover:bg-slate-50 text-slate-700 cursor-pointer' : 'text-slate-300 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <span className="text-blue-600 font-bold text-sm">↔</span>
+              <span>Flip Horizontal</span>
+            </button>
+            <button
+              onClick={() => {
+                if (selectedElementIds.length > 0) {
+                  handleMirrorAction('flip-vertical');
+                  setActiveFlyout(null);
+                }
+              }}
+              disabled={selectedElementIds.length === 0}
+              className={`w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition ${
+                selectedElementIds.length > 0 ? 'hover:bg-slate-50 text-slate-700 cursor-pointer' : 'text-slate-300 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <span className="text-blue-600 font-bold text-sm">↕</span>
+              <span>Flip Vertical</span>
+            </button>
+
+            <div className="h-[1px] bg-slate-100 my-1.5"></div>
+            
+            <div className="px-3 py-1 text-[9px] font-bold text-blue-500 uppercase tracking-wider">Clone & Symmetrical Mirror</div>
+            <button
+              onClick={() => {
+                if (selectedElementIds.length > 0) {
+                  handleMirrorAction('mirror-horizontal');
+                  setActiveFlyout(null);
+                }
+              }}
+              disabled={selectedElementIds.length === 0}
+              className={`w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition ${
+                selectedElementIds.length > 0 ? 'hover:bg-slate-50 text-slate-700 cursor-pointer' : 'text-slate-300 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <span className="text-emerald-500 text-sm">👥</span>
+              <span>Mirror Left ↔ Right</span>
+            </button>
+            <button
+              onClick={() => {
+                if (selectedElementIds.length > 0) {
+                  handleMirrorAction('mirror-vertical');
+                  setActiveFlyout(null);
+                }
+              }}
+              disabled={selectedElementIds.length === 0}
+              className={`w-full text-left px-4 py-2 text-xs flex items-center gap-2.5 transition ${
+                selectedElementIds.length > 0 ? 'hover:bg-slate-50 text-slate-700 cursor-pointer' : 'text-slate-300 cursor-not-allowed opacity-50'
+              }`}
+            >
+              <span className="text-emerald-500 text-sm">👥</span>
+              <span>Mirror Top ↕ Bottom</span>
+            </button>
+          </div>
+        )}
 
         {/* --- Main Art Canvas Stage --- */}
         <div
@@ -2358,6 +3055,10 @@ export default function App() {
             className={`absolute inset-0 ${
               isMiddleClickPanning
                 ? 'cursor-grabbing'
+                : (tool === 'pen' && isCtrlKeyHeld)
+                ? 'cursor-default'
+                : (tool === 'pen' && isAltKeyHeld)
+                ? 'cursor-crosshair'
                 : tool === 'select'
                 ? 'cursor-default'
                 : 'cursor-crosshair'
@@ -2411,6 +3112,8 @@ export default function App() {
                     opacity={tracingImage.opacity}
                     onMouseDown={(e) => {
                       if (tracingImage.locked) return;
+                      if (e.button === 1) return; // Allow middle-click to bubble to canvas for panning
+                      if (e.button !== 0) return; // Only left-click starts dragging
                       e.stopPropagation();
                       setIsDragging(true);
                       const rawCoords = getCanvasCoords(e);
@@ -2589,6 +3292,12 @@ export default function App() {
                         strokeWidth={1.5 / zoom}
                         style={{ cursor: h.cursor }}
                         onMouseDown={(e) => {
+                          if (e.button === 1) return; // Allow middle-click to bubble to canvas for panning
+                          if (e.button !== 0) return; // Only left-click starts dragging
+
+                          // Save starting state for undo/redo
+                          layersBeforeInteractionRef.current = JSON.parse(JSON.stringify(layers));
+
                           e.stopPropagation();
                           e.preventDefault();
                           setIsResizing(true);
@@ -2787,7 +3496,7 @@ export default function App() {
                       key={color.name}
                       onClick={() => {
                         setFillColor(color.value);
-                        updateSelectedElementsProperty('fill', color.value);
+                        updateSelectedElementsProperty('fill', color.value, true);
                       }}
                       className={`h-7 rounded border relative transition flex items-center justify-center ${
                         fillColor === color.value ? 'border-blue-500 ring-2 ring-blue-100' : 'border-slate-200 hover:border-slate-400'
@@ -2821,10 +3530,11 @@ export default function App() {
                     max="1"
                     step="0.05"
                     value={fillOpacity}
+                    onMouseDown={() => pushHistory(layers)}
                     onChange={(e) => {
                       const val = parseFloat(e.target.value);
                       setFillOpacity(val);
-                      updateSelectedElementsProperty('fillOpacity', val);
+                      updateSelectedElementsProperty('fillOpacity', val, false);
                     }}
                     className="w-full accent-blue-600 h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer"
                   />
@@ -2839,9 +3549,10 @@ export default function App() {
                     <input
                       type="color"
                       value={strokeColor.startsWith('#') ? strokeColor : '#111827'}
+                      onMouseDown={() => pushHistory(layers)}
                       onChange={(e) => {
                         setStrokeColor(e.target.value);
-                        updateSelectedElementsProperty('stroke', e.target.value);
+                        updateSelectedElementsProperty('stroke', e.target.value, false);
                       }}
                       className="w-8 h-8 rounded border border-slate-200 bg-transparent cursor-pointer"
                     />
@@ -2856,10 +3567,11 @@ export default function App() {
                     min="1"
                     max="24"
                     value={strokeWidth}
+                    onFocus={() => pushHistory(layers)}
                     onChange={(e) => {
                       const val = Math.max(1, parseInt(e.target.value) || 1);
                       setStrokeWidth(val);
-                      updateSelectedElementsProperty('strokeWidth', val);
+                      updateSelectedElementsProperty('strokeWidth', val, false);
                     }}
                     className="w-full bg-white border border-slate-200 rounded px-2 py-1 text-xs text-slate-800 font-mono focus:border-blue-500 focus:outline-none"
                   />
@@ -2874,7 +3586,7 @@ export default function App() {
                     type="checkbox"
                     checked={activeSelectedElement.closed}
                     onChange={(e) => {
-                      updateSelectedElementsProperty('closed', e.target.checked);
+                      updateSelectedElementsProperty('closed', e.target.checked, true);
                     }}
                     className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500 bg-white border-slate-200"
                   />
@@ -2892,7 +3604,7 @@ export default function App() {
                       return (
                         <button
                           key={t}
-                          onClick={() => updateSelectedNodeProperty('type', t)}
+                          onClick={() => updateSelectedNodeProperty('type', t, true)}
                           className={`py-1 rounded text-[10px] font-semibold capitalize transition ${
                             isActive ? 'bg-red-600 text-white shadow-sm' : 'bg-white text-slate-600 hover:bg-slate-50 border border-slate-200'
                           }`}
@@ -2911,194 +3623,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Section: Clipboard Actions */}
-          <div className="p-4 border-b border-slate-200/80 bg-slate-50/40">
-            <h3 className="text-xs font-bold uppercase text-blue-600 tracking-wider mb-2.5 flex items-center gap-1.5">
-              <span>📋 Clipboard Actions</span>
-            </h3>
-            <div className="grid grid-cols-2 gap-2 mb-2">
-              <button
-                onClick={handleCopy}
-                disabled={selectedElementIds.length === 0}
-                className={`py-2 px-3 rounded border text-xs text-center font-semibold transition flex items-center justify-center gap-1 cursor-pointer ${
-                  selectedElementIds.length > 0
-                    ? 'bg-white hover:bg-slate-50 border-slate-200 text-slate-700 shadow-sm'
-                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed'
-                }`}
-                title="Copy selected elements to clipboard (Ctrl+C)"
-              >
-                Copy Selection
-              </button>
-              <button
-                onClick={handlePaste}
-                disabled={copiedElements.length === 0}
-                className={`py-2 px-3 rounded border text-xs text-center font-semibold transition flex items-center justify-center gap-1 cursor-pointer ${
-                  copiedElements.length > 0
-                    ? 'bg-blue-50 hover:bg-blue-100 border-blue-200 text-blue-700 shadow-sm'
-                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed'
-                }`}
-                title="Paste copied elements offset on canvas (Ctrl+V)"
-              >
-                Paste ({copiedElements.length})
-              </button>
-            </div>
-            <p className="text-[9px] text-slate-400 font-mono text-center">
-              💡 Tip: You can use standard <strong className="text-slate-500">Ctrl + C</strong> and <strong className="text-slate-500">Ctrl + V</strong> keys!
-            </p>
-          </div>
 
-          {/* Section: Pathfinder Tools */}
-          <div className="p-4 border-b border-slate-200/80 bg-slate-50/40">
-            <h3 className="text-xs font-bold uppercase text-slate-700 tracking-wider mb-2 flex items-center justify-between">
-              <span>Boolean Pathfinder</span>
-              {selectedElementIds.length >= 2 ? (
-                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-100 text-emerald-600 animate-pulse">
-                  ✨ {selectedElementIds.length} Shapes Selected
-                </span>
-              ) : (
-                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-amber-50 border border-amber-100 text-amber-600">
-                  ⚠️ Select 2+ overlapping shapes
-                </span>
-              )}
-            </h3>
-            <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">
-              Combine, intersect, or subtract overlapping elements to form complex custom paths with one-click:
-            </p>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={() => handlePathfinder('union')}
-                disabled={selectedElementIds.length < 2}
-                className={`py-2 px-2 rounded border transition text-[11px] font-semibold shadow-sm flex flex-col items-center gap-1.5 justify-center ${
-                  selectedElementIds.length >= 2
-                    ? 'bg-white hover:bg-blue-50 hover:border-blue-300 border-slate-200 text-slate-700 cursor-pointer'
-                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed opacity-60'
-                }`}
-                title="Union: Combine multiple shapes into a single outline path"
-              >
-                <svg className={`w-6 h-6 ${selectedElementIds.length >= 2 ? 'text-blue-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
-                  <rect x="11" y="3" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
-                  <rect x="11" y="11" width="2" height="2" fill="currentColor" fillOpacity="0.15" className="stroke-none" />
-                </svg>
-                <span>Union</span>
-              </button>
-
-              <button
-                onClick={() => handlePathfinder('subtract')}
-                disabled={selectedElementIds.length < 2}
-                className={`py-2 px-2 rounded border transition text-[11px] font-semibold shadow-sm flex flex-col items-center gap-1.5 justify-center ${
-                  selectedElementIds.length >= 2
-                    ? 'bg-white hover:bg-red-50 hover:border-red-300 border-slate-200 text-slate-700 cursor-pointer'
-                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed opacity-60'
-                }`}
-                title="Subtract: Cut the overlapping front shape outlines out from the back shape"
-              >
-                <svg className={`w-6 h-6 ${selectedElementIds.length >= 2 ? 'text-red-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
-                  <rect x="11" y="3" width="10" height="10" rx="1.5" fill="none" strokeDasharray="3 3" />
-                  <rect x="11" y="11" width="2" height="2" fill="white" className="stroke-none" />
-                </svg>
-                <span>Subtract</span>
-              </button>
-
-              <button
-                onClick={() => handlePathfinder('intersect')}
-                disabled={selectedElementIds.length < 2}
-                className={`py-2 px-2 rounded border transition text-[11px] font-semibold shadow-sm flex flex-col items-center gap-1.5 justify-center ${
-                  selectedElementIds.length >= 2
-                    ? 'bg-white hover:bg-emerald-50 hover:border-emerald-300 border-slate-200 text-slate-700 cursor-pointer'
-                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed opacity-60'
-                }`}
-                title="Intersect: Retain only the region where all selected shapes overlap"
-              >
-                <svg className={`w-6 h-6 ${selectedElementIds.length >= 2 ? 'text-emerald-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="11" width="10" height="10" rx="1.5" fill="none" />
-                  <rect x="11" y="3" width="10" height="10" rx="1.5" fill="none" />
-                  <rect x="11" y="11" width="2" height="2" fill="currentColor" fillOpacity="0.4" />
-                </svg>
-                <span>Intersect</span>
-              </button>
-
-              <button
-                onClick={() => handlePathfinder('exclude')}
-                disabled={selectedElementIds.length < 2}
-                className={`py-2 px-2 rounded border transition text-[11px] font-semibold shadow-sm flex flex-col items-center gap-1.5 justify-center ${
-                  selectedElementIds.length >= 2
-                    ? 'bg-white hover:bg-amber-50 hover:border-amber-300 border-slate-200 text-slate-700 cursor-pointer'
-                    : 'bg-slate-50/50 border-slate-100 text-slate-300 cursor-not-allowed opacity-60'
-                }`}
-                title="Exclude: Keep all regions of the shapes, excluding their overlapping intersection"
-              >
-                <svg className={`w-6 h-6 ${selectedElementIds.length >= 2 ? 'text-amber-600' : 'text-slate-300'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="11" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
-                  <rect x="11" y="3" width="10" height="10" rx="1.5" fill="currentColor" fillOpacity="0.15" />
-                  <rect x="11" y="11" width="2" height="2" fill="white" className="stroke-none" />
-                </svg>
-                <span>Exclude</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Section: Mirror & Symmetry Tools */}
-          <div className="p-4 border-b border-slate-200/80 bg-slate-50/40">
-            <h3 className="text-xs font-bold uppercase text-blue-600 tracking-wider mb-2.5 flex items-center gap-1.5">
-              <Compass size={14} className="text-blue-600" />
-              Mirror & Symmetry
-            </h3>
-            <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">
-              Flip your selected vectors, or clone them symmetrically to create stunning repeating patterns:
-            </p>
-            
-            {selectedElementIds.length > 0 ? (
-              <div className="space-y-3">
-                {/* Sub-label: Flip Operations */}
-                <div>
-                  <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Flip Selected</div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={() => handleMirrorAction('flip-horizontal')}
-                      className="py-2 px-2 bg-white hover:bg-slate-50 hover:border-slate-400 rounded border border-slate-200 text-[11px] text-slate-700 transition text-center font-semibold shadow-sm cursor-pointer"
-                      title="Flip selected elements horizontally"
-                    >
-                      ↔ Flip Horiz
-                    </button>
-                    <button
-                      onClick={() => handleMirrorAction('flip-vertical')}
-                      className="py-2 px-2 bg-white hover:bg-slate-50 hover:border-slate-400 rounded border border-slate-200 text-[11px] text-slate-700 transition text-center font-semibold shadow-sm cursor-pointer"
-                      title="Flip selected elements vertically"
-                    >
-                      ↕ Flip Vert
-                    </button>
-                  </div>
-                </div>
-
-                {/* Sub-label: Mirror Duplicate Operations */}
-                <div>
-                  <div className="text-[9px] font-bold text-blue-600 uppercase tracking-wider mb-1">Clone & Symmetrical Mirror</div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={() => handleMirrorAction('mirror-horizontal')}
-                      className="py-2 px-2 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded text-[11px] text-blue-700 transition text-center font-semibold flex items-center justify-center gap-1 shadow-sm cursor-pointer"
-                      title="Duplicate and mirror across the horizontal center axis"
-                    >
-                      <span>👥 Mirror Left ↔ Right</span>
-                    </button>
-                    <button
-                      onClick={() => handleMirrorAction('mirror-vertical')}
-                      className="py-2 px-2 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded text-[11px] text-blue-700 transition text-center font-semibold flex items-center justify-center gap-1 shadow-sm cursor-pointer"
-                      title="Duplicate and mirror across the vertical center axis"
-                    >
-                      <span>👥 Mirror Top ↕ Bottom</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="p-3 bg-slate-50/40 rounded border border-dashed border-slate-200 text-center text-slate-400 text-[11px]">
-                Select one or more items on the canvas to use the mirroring or flip tools.
-              </div>
-            )}
-          </div>
 
           {/* Section: Tracing Image Parameters and Opacity */}
           {tracingImage && (
@@ -3309,15 +3834,68 @@ export default function App() {
         </aside>
       </div>
 
-      {/* --- Simple Status bottom-rail --- */}
-      <footer className="h-8 bg-white border-t border-slate-200/80 px-6 flex items-center justify-between text-[11px] text-slate-500 font-mono z-25 select-none">
-        <div>
-          Tool: <span className="text-slate-800 capitalize font-bold">{tool}</span>
-          {activePathId && <span className="text-blue-600 ml-2 animate-pulse font-semibold">• Active pen line drawing...</span>}
+      {/* --- Status & Illustrator Shortcut Hint Rail --- */}
+      <footer className="h-9 bg-white border-t border-slate-200/80 px-4 sm:px-6 flex items-center justify-between text-[11px] text-slate-500 font-mono z-25 select-none gap-2">
+        <div className="flex items-center gap-2 overflow-hidden">
+          <div>
+            Tool: <span className="text-slate-800 capitalize font-bold">{tool}</span>
+          </div>
+          {activePathId && (
+            <span className="text-blue-600 font-semibold flex items-center gap-1">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-600 animate-ping"></span>
+              Drawing path
+            </span>
+          )}
+
+          {/* Active Modifier Indicators */}
+          <div className="flex items-center gap-1 ml-2 text-[10px]">
+            <span
+              className={`px-1.5 py-0.5 rounded border ${
+                isShiftKeyHeld
+                  ? 'bg-blue-600 border-blue-700 text-white font-bold shadow-xs'
+                  : 'bg-slate-100 border-slate-200 text-slate-500'
+              }`}
+            >
+              Shift
+            </span>
+            <span
+              className={`px-1.5 py-0.5 rounded border ${
+                isCtrlKeyHeld
+                  ? 'bg-blue-600 border-blue-700 text-white font-bold shadow-xs'
+                  : 'bg-slate-100 border-slate-200 text-slate-500'
+              }`}
+            >
+              Ctrl
+            </span>
+            <span
+              className={`px-1.5 py-0.5 rounded border ${
+                isAltKeyHeld
+                  ? 'bg-blue-600 border-blue-700 text-white font-bold shadow-xs'
+                  : 'bg-slate-100 border-slate-200 text-slate-500'
+              }`}
+            >
+              Alt
+            </span>
+          </div>
         </div>
-        <div className="flex gap-4">
-          <span>Active layer nodes: {getActiveLayer().elements.reduce((acc, el) => acc + el.nodes.length, 0)}</span>
-          <span className="hidden sm:inline">Press Esc/Enter to complete pen stroke. Delete keys clear points.</span>
+
+        <div className="flex items-center gap-3 text-right">
+          {tool === 'pen' ? (
+            <span className="hidden md:inline text-[10px] text-slate-600">
+              Shift: 45° snap | Ctrl+Click: deselect/direct-select | Alt: convert anchor / break handles | 2x-click: smooth/corner
+            </span>
+          ) : tool === 'rect' || tool === 'ellipse' || tool === 'triangle' || tool === 'spiral' ? (
+            <span className="hidden md:inline text-[10px] text-slate-600">
+              Click & Drag to size | Shift: 1:1 ratio | Alt: center anchor
+            </span>
+          ) : (
+            <span className="hidden md:inline text-[10px] text-slate-400">
+              Middle-click/Wheel: pan canvas | Mouse wheel: zoom | Ctrl+Z / Ctrl+Y: undo/redo
+            </span>
+          )}
+          <span className="text-[10px] text-slate-400">
+            {getActiveLayer().elements.reduce((acc, el) => acc + el.nodes.length, 0)} nodes
+          </span>
         </div>
       </footer>
     </div>

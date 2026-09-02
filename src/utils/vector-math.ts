@@ -283,3 +283,17 @@ export function snapPoint(
 
   return { point: p, snappedTo: 'none' };
 }
+
+export function snapAngle45(origin: Point, target: Point): Point {
+  const dx = target.x - origin.x;
+  const dy = target.y - origin.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist === 0) return target;
+  const angle = Math.atan2(dy, dx);
+  const step = Math.PI / 4; // 45 degrees
+  const snappedAngle = Math.round(angle / step) * step;
+  return {
+    x: origin.x + Math.cos(snappedAngle) * dist,
+    y: origin.y + Math.sin(snappedAngle) * dist,
+  };
+}
