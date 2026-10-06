@@ -15,6 +15,7 @@ import {
   ChevronDown,
   RefreshCw,
   Plus,
+  Minus,
   Compass,
   Grid,
   Maximize2,
@@ -30,7 +31,9 @@ import {
   Redo,
   Save,
   FolderOpen,
-  Spline
+  Spline,
+  Paintbrush,
+  Shapes
 } from 'lucide-react';
 import {
   Point,
@@ -42,7 +45,9 @@ import {
   GridConfig,
   SnapConfig,
   NodeType,
-  AlignmentGuide
+  AlignmentGuide,
+  BrushDefinition,
+  BrushType
 } from './types';
 import {
   getPathData,
@@ -50,7 +55,9 @@ import {
   snapPoint,
   distance,
   getSegmentCommand,
-  snapAngle45
+  snapAngle45,
+  splitSegmentAtPoint,
+  findNearestSegmentOnElement
 } from './utils/vector-math';
 import {
   getSpiralTemplate,
@@ -59,7 +66,10 @@ import {
 } from './utils/starter-templates';
 import { exportToDXF } from './utils/dxf-exporter';
 import { mirrorElement, getCombinedBoundingBox, getElementBoundingBox } from './utils/mirror-utils';
-import { convertStrokeToPath, StrokeToPathOptions } from './utils/stroke-to-path';
+import { convertStrokeToPath, StrokeToPathOptions, simplifyPoints, pointsToVectorNodes } from './utils/stroke-to-path';
+import { DEFAULT_BRUSHES, applyBrushToStroke, createBrushFromSelection } from './utils/brush-engine';
+import { BrushModal } from './components/BrushModal';
+import { BrushesPanel } from './components/BrushesPanel';
 
 // Professional designer color palette for vector assets
 const ART_PALETTE = [
@@ -171,10 +181,44 @@ export default function App() {
   const [isMiddleClickPanning, setIsMiddleClickPanning] = useState<boolean>(false);
   const selectionStartWithShiftRef = useRef<boolean>(false);
   const initialSelectedIdsRef = useRef<string[]>([]);
-  const [activeFlyout, setActiveFlyout] = useState<'pathfinder' | 'mirror' | 'strokeToPath' | null>(null);
+  const [activeFlyout, setActiveFlyout] = useState<'pathfinder' | 'mirror' | 'strokeToPath' | 'brushes' | 'penTools' | null>(null);
+  const [segmentHoverPreview, setSegmentHoverPreview] = useState<{
+    elementId: string;
+    fromIdx: number;
+    toIdx: number;
+    point: Point;
+  } | null>(null);
   const [strokeToPathMode, setStrokeToPathMode] = useState<'outline' | 'dual-lines'>('outline');
   const [strokeToPathCap, setStrokeToPathCap] = useState<'round' | 'butt' | 'square'>('round');
   const [strokeToPathKeepOriginal, setStrokeToPathKeepOriginal] = useState<boolean>(false);
+
+  // --- Illustrator Brush Engine State ---
+  const [brushes, setBrushes] = useState<BrushDefinition[]>(() => {
+    try {
+      const saved = localStorage.getItem('vector_brushes_library');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const customIds = new Set(parsed.map((b: any) => b.id));
+          const defaults = DEFAULT_BRUSHES.filter(d => !customIds.has(d.id));
+          return [...defaults, ...parsed];
+        }
+      }
+    } catch (e) {
+      console.error('Error loading saved brushes', e);
+    }
+    return DEFAULT_BRUSHES;
+  });
+  const [activeBrushId, setActiveBrushId] = useState<string | null>(null);
+  const [isBrushModalOpen, setIsBrushModalOpen] = useState<boolean>(false);
+  const [expandToast, setExpandToast] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (expandToast) {
+      const timer = setTimeout(() => setExpandToast(null), 3500);
+      return () => clearTimeout(timer);
+    }
+  }, [expandToast]);
 
   // --- Resizing / Transforming States ---
   const [isResizing, setIsResizing] = useState<boolean>(false);
@@ -711,6 +755,400 @@ export default function App() {
     setTool('select');
   };
 
+  // --- ILLUSTRATOR BRUSH ENGINE ACTIONS ---
+
+  // Save new custom brush created from selected shape(s)
+  const handleSaveNewBrush = (newBrush: BrushDefinition) => {
+    pushHistory(layers);
+    setBrushes(prev => {
+      const updated = [newBrush, ...prev];
+      try {
+        const customOnly = updated.filter(b => !b.isDefault);
+        localStorage.setItem('vector_brushes_library', JSON.stringify(customOnly));
+      } catch (err) {
+        console.error('Failed to save brushes to localStorage', err);
+      }
+      return updated;
+    });
+
+    setActiveBrushId(newBrush.id);
+
+    // If elements are selected, apply the newly saved brush immediately!
+    if (selectedElementIds.length > 0) {
+      setLayers(prev =>
+        prev.map(layer => ({
+          ...layer,
+          elements: layer.elements.map(el =>
+            selectedElementIds.includes(el.id)
+              ? { ...el, brushId: newBrush.id }
+              : el
+          ),
+        }))
+      );
+    }
+  };
+
+  // Select / Apply brush to current selection or activate for next stroke
+  const handleSelectBrush = (brushId: string | null) => {
+    setActiveBrushId(brushId);
+
+    if (selectedElementIds.length > 0) {
+      pushHistory(layers);
+      setLayers(prev =>
+        prev.map(layer => ({
+          ...layer,
+          elements: layer.elements.map(el => {
+            if (selectedElementIds.includes(el.id)) {
+              return { ...el, brushId: brushId || undefined };
+            }
+            return el;
+          }),
+        }))
+      );
+    }
+  };
+
+  // Delete custom brush
+  const handleDeleteBrush = (brushId: string) => {
+    setBrushes(prev => {
+      const updated = prev.filter(b => b.id !== brushId);
+      try {
+        const customOnly = updated.filter(b => !b.isDefault);
+        localStorage.setItem('vector_brushes_library', JSON.stringify(customOnly));
+      } catch (err) {
+        console.error('Failed to delete brush from localStorage', err);
+      }
+      return updated;
+    });
+
+    if (activeBrushId === brushId) {
+      setActiveBrushId(null);
+    }
+  };
+
+  // Illustrator "Expand / Expand Appearance" (Object > Expand / Expand Appearance)
+  // Bakes brushes & stroked paths into independent, editable closed vector shapes!
+  const handleExpandToShapes = () => {
+    const allEls = getAllElements();
+    const selectedEls = allEls.filter(el => selectedElementIds.includes(el.id));
+
+    if (selectedEls.length === 0) {
+      alert("Tēnā koa, whiria tētahi ara (Please select at least one path or brush stroke to expand into shapes).");
+      return;
+    }
+
+    pushHistory(layers);
+
+    const newlyCreatedIds: string[] = [];
+    const elementsToRemoveIds: string[] = [];
+    const newGeneratedElements: PathElement[] = [];
+
+    selectedEls.forEach(el => {
+      // CASE 1: Path has an applied brush (e.g. 4 rectangles or any custom brush)
+      if (el.brushId) {
+        const brush = brushes.find(b => b.id === el.brushId);
+        if (brush) {
+          const deformed = applyBrushToStroke(el, brush);
+          deformed.forEach((dEl, idx) => {
+            if (dEl.closed && dEl.fill !== 'none') {
+              // Simplify points slightly so anchor nodes are clean and pleasant to edit with Direct Selection (A)
+              const rawPts = dEl.nodes.map(n => n.anchor);
+              const simplifiedPts = simplifyPoints(rawPts, 0.35);
+              const cleanNodes = pointsToVectorNodes(simplifiedPts, true);
+
+              const shapeEl: PathElement = {
+                id: `expanded-shape-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+                name: `${el.name} Shape ${idx + 1}`,
+                type: 'path',
+                nodes: cleanNodes.length >= 3 ? cleanNodes : dEl.nodes,
+                closed: true,
+                fill: dEl.fill,
+                fillOpacity: dEl.fillOpacity ?? 1,
+                stroke: dEl.stroke !== 'none' ? dEl.stroke : 'none',
+                strokeWidth: dEl.stroke !== 'none' ? dEl.strokeWidth : 0,
+                visible: true,
+                locked: false,
+              };
+              newGeneratedElements.push(shapeEl);
+              newlyCreatedIds.push(shapeEl.id);
+            } else {
+              // Stroked brush part -> trace into closed outline shape!
+              const outlineShapes = convertStrokeToPath(dEl, { mode: 'outline' });
+              outlineShapes.forEach(s => {
+                newGeneratedElements.push(s);
+                newlyCreatedIds.push(s.id);
+              });
+            }
+          });
+          elementsToRemoveIds.push(el.id);
+          return;
+        }
+      }
+
+      // CASE 2: Regular stroked path -> Outline Stroke into closed shape!
+      if (el.nodes.length >= 2 && el.strokeWidth > 0 && el.stroke !== 'none') {
+        const outlineShapes = convertStrokeToPath(el, { mode: 'outline' });
+        if (outlineShapes.length > 0) {
+          outlineShapes.forEach(s => {
+            newGeneratedElements.push(s);
+            newlyCreatedIds.push(s.id);
+          });
+          elementsToRemoveIds.push(el.id);
+          return;
+        }
+      }
+    });
+
+    if (newGeneratedElements.length === 0) {
+      alert("Could not expand selected elements into shapes. Please ensure paths have a stroke or brush applied.");
+      return;
+    }
+
+    setLayers(prev =>
+      prev.map(layer => {
+        const remaining = layer.elements.filter(el => !elementsToRemoveIds.includes(el.id));
+        if (layer.id === activeLayerId) {
+          return {
+            ...layer,
+            elements: [...remaining, ...newGeneratedElements],
+          };
+        }
+        return {
+          ...layer,
+          elements: remaining,
+        };
+      })
+    );
+
+    setSelectedElementIds(newlyCreatedIds);
+    setTool('select');
+    setExpandToast(`Kua whakatōkia ngā āhua! (${newGeneratedElements.length} closed vector shape${newGeneratedElements.length > 1 ? 's' : ''} created)`);
+  };
+
+  // Alias for backward compatibility with panel callbacks
+  const handleExpandAppearance = handleExpandToShapes;
+
+  // --- ILLUSTRATOR PEN TOOLS: ADD / DELETE / CONVERT / SUBDIVIDE ANCHOR NODES ---
+
+  // Add an anchor point along an existing straight or curved segment (de Casteljau's algorithm)
+  const handleAddNodeToSegment = (
+    elementId: string,
+    fromIdx: number,
+    toIdx: number,
+    clickPos: Point
+  ) => {
+    pushHistory(layers);
+    const allEls = getAllElements();
+    const el = allEls.find(item => item.id === elementId);
+    if (!el || !el.nodes || el.nodes.length < 2) return;
+
+    const fromNode = el.nodes[fromIdx];
+    const toNode = el.nodes[toIdx];
+    if (!fromNode || !toNode || !fromNode.anchor || !toNode.anchor) return;
+
+    const splitRes = splitSegmentAtPoint(fromNode, toNode, clickPos);
+    if (!splitRes || !splitRes.newNode || !splitRes.newNode.anchor) return;
+
+    setLayers(prev =>
+      prev.map(layer => ({
+        ...layer,
+        elements: layer.elements.map(item => {
+          if (item.id === elementId) {
+            const validNodes = item.nodes.filter(n => n && n.anchor);
+            if (fromIdx >= validNodes.length || toIdx >= validNodes.length) return item;
+
+            const newNodes = [...validNodes];
+            // Update previous node handleOut
+            newNodes[fromIdx] = {
+              ...newNodes[fromIdx],
+              handleOut: splitRes.prevNodeHandleOut,
+            };
+            // Update next node handleIn
+            newNodes[toIdx] = {
+              ...newNodes[toIdx],
+              handleIn: splitRes.nextNodeHandleIn,
+            };
+            // Insert new node immediately after fromIdx
+            newNodes.splice(fromIdx + 1, 0, splitRes.newNode);
+
+            return {
+              ...item,
+              nodes: newNodes.filter(n => n && n.anchor),
+            };
+          }
+          return item;
+        }),
+      }))
+    );
+
+    setSelectedElementIds([elementId]);
+    setSelectedNodeInfo({ elementId, nodeId: splitRes.newNode.id });
+    setSelectedHandle('anchor');
+    setSegmentHoverPreview(null);
+    setExpandToast('Anchor point added on path (+)');
+  };
+
+  // Delete an anchor point from a path (Delete Anchor Point Tool / Pen-)
+  const handleDeleteNode = (elementId: string, nodeId: string) => {
+    pushHistory(layers);
+    setLayers(prev =>
+      prev.map(layer => ({
+        ...layer,
+        elements: layer.elements
+          .map(el => {
+            if (el.id === elementId) {
+              const filteredNodes = el.nodes.filter(n => n && n.anchor && n.id !== nodeId);
+              return { ...el, nodes: filteredNodes };
+            }
+            return el;
+          })
+          .filter(el => el.nodes.length > 0),
+      }))
+    );
+    setSelectedNodeInfo(null);
+    setExpandToast('Anchor point removed (-)');
+  };
+
+  // Illustrator "Object > Path > Add Anchor Points" (Subdivides all segments)
+  const handleAddAnchorPointsToPath = (elementId?: string) => {
+    const targetIds = elementId ? [elementId] : selectedElementIds;
+    if (targetIds.length === 0) return;
+    pushHistory(layers);
+
+    setLayers(prev =>
+      prev.map(layer => ({
+        ...layer,
+        elements: layer.elements.map(el => {
+          if (!targetIds.includes(el.id) || !el.nodes || el.nodes.length < 2) return el;
+
+          const validNodes = el.nodes.filter(n => n && n.anchor);
+          if (validNodes.length < 2) return el;
+
+          const segCount = el.closed ? validNodes.length : validNodes.length - 1;
+          const clonedNodes: VectorNode[] = validNodes.map(n => ({
+            ...n,
+            anchor: { ...n.anchor },
+            handleIn: n.handleIn ? { ...n.handleIn } : undefined,
+            handleOut: n.handleOut ? { ...n.handleOut } : undefined,
+          }));
+
+          const newNodes: VectorNode[] = [];
+
+          for (let i = 0; i < segCount; i++) {
+            const nextI = (i + 1) % clonedNodes.length;
+            const n1 = clonedNodes[i];
+            const n2 = clonedNodes[nextI];
+
+            const p0 = n1.anchor;
+            const p1 = n1.handleOut || p0;
+            const p2 = n2.handleIn || n2.anchor;
+            const p3 = n2.anchor;
+            const midPt = {
+              x: 0.125 * p0.x + 0.375 * p1.x + 0.375 * p2.x + 0.125 * p3.x,
+              y: 0.125 * p0.y + 0.375 * p1.y + 0.375 * p2.y + 0.125 * p3.y,
+            };
+
+            const split = splitSegmentAtPoint(n1, n2, midPt);
+            n1.handleOut = split.prevNodeHandleOut;
+            n2.handleIn = split.nextNodeHandleIn;
+
+            newNodes.push(n1);
+            newNodes.push(split.newNode);
+          }
+
+          if (!el.closed) {
+            newNodes.push(clonedNodes[clonedNodes.length - 1]);
+          }
+
+          return {
+            ...el,
+            nodes: newNodes.filter(n => n && n.anchor),
+          };
+        }),
+      }))
+    );
+    setExpandToast('Added midpoint anchor points (Subdivided segments)');
+  };
+
+  // Convert Anchor Point between Corner and Smooth (Anchor Point Tool / Shift+C)
+  const handleConvertNode = (elementId: string, nodeId: string, targetType: 'corner' | 'smooth') => {
+    pushHistory(layers);
+    setLayers(prev =>
+      prev.map(layer => ({
+        ...layer,
+        elements: layer.elements.map(el => {
+          if (el.id === elementId) {
+            const nodeIdx = el.nodes.findIndex(n => n.id === nodeId);
+            if (nodeIdx === -1) return el;
+            const node = el.nodes[nodeIdx];
+
+            if (targetType === 'corner') {
+              return {
+                ...el,
+                nodes: el.nodes.map(n =>
+                  n.id === nodeId ? { ...n, handleIn: undefined, handleOut: undefined, type: 'corner' } : n
+                ),
+              };
+            } else {
+              // Smooth: compute tangent handles
+              const prevNode = nodeIdx > 0
+                ? el.nodes[nodeIdx - 1]
+                : el.closed && el.nodes.length > 2 ? el.nodes[el.nodes.length - 1] : null;
+              const nextNode = nodeIdx < el.nodes.length - 1
+                ? el.nodes[nodeIdx + 1]
+                : el.closed && el.nodes.length > 2 ? el.nodes[0] : null;
+
+              let handleIn: Point | undefined = undefined;
+              let handleOut: Point | undefined = undefined;
+
+              if (prevNode && nextNode) {
+                const dx = nextNode.anchor.x - prevNode.anchor.x;
+                const dy = nextNode.anchor.y - prevNode.anchor.y;
+                const len = Math.hypot(dx, dy) || 1;
+                const d1 = distance(node.anchor, prevNode.anchor);
+                const d2 = distance(node.anchor, nextNode.anchor);
+                const handleLen = Math.max(15, Math.min(d1, d2) * 0.35);
+                const ux = (dx / len) * handleLen;
+                const uy = (dy / len) * handleLen;
+                handleIn = { x: node.anchor.x - ux, y: node.anchor.y - uy };
+                handleOut = { x: node.anchor.x + ux, y: node.anchor.y + uy };
+              } else if (nextNode) {
+                const dx = nextNode.anchor.x - node.anchor.x;
+                const dy = nextNode.anchor.y - node.anchor.y;
+                const len = Math.hypot(dx, dy) || 1;
+                const handleLen = Math.max(15, len * 0.35);
+                const ux = (dx / len) * handleLen;
+                const uy = (dy / len) * handleLen;
+                handleOut = { x: node.anchor.x + ux, y: node.anchor.y + uy };
+                handleIn = { x: node.anchor.x - ux, y: node.anchor.y - uy };
+              } else if (prevNode) {
+                const dx = node.anchor.x - prevNode.anchor.x;
+                const dy = node.anchor.y - prevNode.anchor.y;
+                const len = Math.hypot(dx, dy) || 1;
+                const handleLen = Math.max(15, len * 0.35);
+                const ux = (dx / len) * handleLen;
+                const uy = (dy / len) * handleLen;
+                handleIn = { x: node.anchor.x - ux, y: node.anchor.y - uy };
+                handleOut = { x: node.anchor.x + ux, y: node.anchor.y + uy };
+              } else {
+                handleIn = { x: node.anchor.x - 30, y: node.anchor.y };
+                handleOut = { x: node.anchor.x + 30, y: node.anchor.y };
+              }
+
+              return {
+                ...el,
+                nodes: el.nodes.map(n =>
+                  n.id === nodeId ? { ...n, handleIn, handleOut, type: 'smooth' } : n
+                ),
+              };
+            }
+          }
+          return el;
+        }),
+      }))
+    );
+  };
+
   // --- Tracing Image Loader ---
   const handleImageFileChange = (e: React.ChangeEvent<HTMLInputElement> | File) => {
     const file = e instanceof File ? e : e.target.files?.[0];
@@ -779,6 +1217,35 @@ export default function App() {
 
     const snappedPt = getSnappedCanvasCoords(e, activePathId || undefined);
 
+    // --- TOOL: ADD ANCHOR POINT (OR PEN CLICK ON SEGMENT) ---
+    if (segmentHoverPreview && (tool === 'pen' || tool === 'add-anchor')) {
+      handleAddNodeToSegment(
+        segmentHoverPreview.elementId,
+        segmentHoverPreview.fromIdx,
+        segmentHoverPreview.toIdx,
+        segmentHoverPreview.point
+      );
+      return;
+    }
+
+    if (tool === 'add-anchor') {
+      const allActive = getAllElements().filter(el => !el.locked);
+      for (const el of allActive) {
+        if (el.nodes.length >= 2) {
+          const nearest = findNearestSegmentOnElement(el, snappedPt, 16 / zoom);
+          if (nearest) {
+            handleAddNodeToSegment(el.id, nearest.segmentIdx, nearest.nextSegmentIdx, nearest.projection);
+            return;
+          }
+        }
+      }
+      return;
+    }
+
+    if (tool === 'delete-anchor' || tool === 'anchor-convert') {
+      return;
+    }
+
     // --- TOOL: PEN ---
     if (tool === 'pen') {
       // Illustrator behavior: Ctrl+Click on empty canvas completes/deselects the active path
@@ -809,6 +1276,7 @@ export default function App() {
           fillOpacity: 1,
           stroke: strokeColor,
           strokeWidth: strokeWidth,
+          brushId: activeBrushId || undefined,
           visible: true,
           locked: false
         };
@@ -1106,7 +1574,7 @@ export default function App() {
     }
 
     // --- CASE 1: Drawing curves interactively while laying Pen Nodes (drag out handles in real time!) ---
-    if (tool === 'pen' && isDrawingDrag && selectedNodeInfo) {
+    if ((tool === 'pen' || tool === 'anchor-convert') && isDrawingDrag && selectedNodeInfo) {
       // Click-dragging updates the handleOut of the clicked anchor, and mirrors handleIn
       const { elementId, nodeId } = selectedNodeInfo;
       setLayers(prev =>
@@ -1176,6 +1644,7 @@ export default function App() {
               // Fetch the original node states from the start backup
               const fromNodeStart = startNodes[fromNodeIdx];
               const toNodeStart = startNodes[toNodeIdx];
+              if (!fromNodeStart?.anchor || !toNodeStart?.anchor) return el;
 
               // Base anchors are fixed during a segment drag
               const A = fromNodeStart.anchor;
@@ -1641,6 +2110,31 @@ export default function App() {
       const combined = Array.from(new Set([...baseIds, ...intersectingElIds]));
       setSelectedElementIds(combined);
     }
+
+    // --- Segment Hover Preview in Pen & Add Anchor Mode ---
+    if (!isDragging && !isDrawingDrag && !isDrawingShape && !isResizing && (tool === 'pen' || tool === 'add-anchor')) {
+      const activeOrSelectedEls = getAllElements().filter(
+        el => !el.locked && el.visible && (selectedElementIds.includes(el.id) || el.id === activePathId || tool === 'add-anchor')
+      );
+      let foundHover: { elementId: string; fromIdx: number; toIdx: number; point: Point } | null = null;
+      for (const el of activeOrSelectedEls) {
+        if (el.nodes.length >= 2) {
+          const nearest = findNearestSegmentOnElement(el, rawPos, 14 / zoom);
+          if (nearest) {
+            foundHover = {
+              elementId: el.id,
+              fromIdx: nearest.segmentIdx,
+              toIdx: nearest.nextSegmentIdx,
+              point: nearest.projection,
+            };
+            break;
+          }
+        }
+      }
+      setSegmentHoverPreview(foundHover);
+    } else if (segmentHoverPreview) {
+      setSegmentHoverPreview(null);
+    }
   };
 
   const handleCanvasMouseUp = () => {
@@ -1813,6 +2307,13 @@ export default function App() {
     layersBeforeInteractionRef.current = JSON.parse(JSON.stringify(layers));
 
     e.stopPropagation();
+
+    // In Pen or Add-Anchor mode, clicking a segment inserts a new anchor node!
+    if (tool === 'pen' || tool === 'add-anchor') {
+      const canvasPos = getCanvasCoords(e);
+      handleAddNodeToSegment(elId, fromIdx, toIdx, canvasPos);
+      return;
+    }
 
     // Ensure we are in direct-select tool to bend curves
     if (tool !== 'direct-select') {
@@ -2012,7 +2513,62 @@ export default function App() {
       }
     }
 
-    if (tool !== 'direct-select') {
+    // Delete Anchor Point Tool:
+    if (tool === 'delete-anchor') {
+      if (handleType === 'anchor') {
+        handleDeleteNode(elementId, nodeId);
+      }
+      return;
+    }
+
+    // Anchor Point Tool (Convert Anchor / Shift+C):
+    if (tool === 'anchor-convert') {
+      if (handleType === 'anchor') {
+        const el = getAllElements().find(item => item.id === elementId);
+        const targetNode = el?.nodes.find(n => n.id === nodeId);
+        if (targetNode) {
+          if (targetNode.handleIn || targetNode.handleOut) {
+            handleConvertNode(elementId, nodeId, 'corner');
+          }
+          setSelectedElementIds([elementId]);
+          setSelectedNodeInfo({ elementId, nodeId });
+          setSelectedHandle('handleOut');
+          setIsDrawingDrag(true);
+          return;
+        }
+      } else if (handleType === 'handleIn' || handleType === 'handleOut') {
+        setSelectedElementIds([elementId]);
+        setSelectedNodeInfo({ elementId, nodeId });
+        setSelectedHandle(handleType);
+        setIsDragging(true);
+        const raw = getCanvasCoords(e as any);
+        setDragStartCanvasPos({ x: raw.x, y: raw.y });
+        setLayers(prev =>
+          prev.map(layer => ({
+            ...layer,
+            elements: layer.elements.map(item =>
+              item.id === elementId
+                ? {
+                    ...item,
+                    nodes: item.nodes.map(n =>
+                      n.id === nodeId ? { ...n, type: 'corner' } : n
+                    ),
+                  }
+                : item
+            ),
+          }))
+        );
+        return;
+      }
+    }
+
+    // Pen Tool: clicking an existing anchor when not actively drawing deletes the anchor
+    if (tool === 'pen' && handleType === 'anchor' && !activePathId) {
+      handleDeleteNode(elementId, nodeId);
+      return;
+    }
+
+    if (tool !== 'direct-select' && tool !== 'pen' && tool !== 'add-anchor') {
       // Toggle back to direct select tool if they clicked individual nodes
       setTool('direct-select');
     }
@@ -2048,7 +2604,31 @@ export default function App() {
       return;
     }
 
+    if (tool === 'add-anchor') {
+      const canvasPos = getCanvasCoords(e);
+      if (el && el.nodes.length >= 2) {
+        const found = findNearestSegmentOnElement(el, canvasPos, 24 / zoom);
+        if (found) {
+          handleAddNodeToSegment(elementId, found.segmentIdx, found.nextSegmentIdx, found.projection);
+          return;
+        }
+      }
+      setSelectedElementIds([elementId]);
+      return;
+    }
+
     if (tool === 'pen') {
+      if (el && el.closed && el.nodes.length >= 2) {
+        const canvasPos = getCanvasCoords(e);
+        const found = findNearestSegmentOnElement(el, canvasPos, 18 / zoom);
+        if (found) {
+          handleAddNodeToSegment(elementId, found.segmentIdx, found.nextSegmentIdx, found.projection);
+          return;
+        }
+        setSelectedElementIds([elementId]);
+        return;
+      }
+
       if (el && !el.closed) {
         // Find if closest endpoint is start or end
         const canvasPos = getCanvasCoords(e);
@@ -2318,6 +2898,9 @@ export default function App() {
       } else if (isModKey && e.shiftKey && (e.key === 'o' || e.key === 'O')) {
         e.preventDefault();
         handleStrokeToPath();
+      } else if (isModKey && !e.shiftKey && (e.key === 'e' || e.key === 'E')) {
+        e.preventDefault();
+        handleExpandToShapes();
       } else if (isModKey && (e.key === 'd' || e.key === 'D')) {
         e.preventDefault();
         handleRepeatTransform();
@@ -2364,6 +2947,15 @@ export default function App() {
           setActivePathId(null);
           setPenPreviewPos(null);
         }
+      } else if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        setTool('add-anchor');
+      } else if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        setTool('delete-anchor');
+      } else if (e.shiftKey && !isModKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        setTool('anchor-convert');
       } else if (e.key === 'p' || e.key === 'P') {
         e.preventDefault();
         activatePenTool();
@@ -2470,10 +3062,23 @@ export default function App() {
       svgContent += `  <!-- Layer: ${l.name} -->\n`;
       l.elements.forEach(el => {
         if (!el.visible) return;
-        const d = getPathData(el.nodes, el.closed);
-        const fillAttr = el.fill === 'none' ? 'none' : el.fill;
-        const opacityAttr = el.fill === 'none' ? '' : ` fill-opacity="${el.fillOpacity}"`;
-        svgContent += `  <path d="${d}" fill="${fillAttr}"${opacityAttr} stroke="${el.stroke}" stroke-width="${el.strokeWidth}" stroke-linecap="round" stroke-linejoin="round" />\n`;
+
+        const appliedBrush = el.brushId ? brushes.find(b => b.id === el.brushId) : null;
+        const deformedBrushEls = appliedBrush ? applyBrushToStroke(el, appliedBrush) : null;
+
+        if (deformedBrushEls && deformedBrushEls.length > 0) {
+          deformedBrushEls.forEach(bEl => {
+            const bD = getPathData(bEl.nodes, bEl.closed);
+            const fillAttr = bEl.fill === 'none' ? 'none' : bEl.fill;
+            const opacityAttr = bEl.fill === 'none' ? '' : ` fill-opacity="${bEl.fillOpacity}"`;
+            svgContent += `  <path d="${bD}" fill="${fillAttr}"${opacityAttr} stroke="${bEl.stroke}" stroke-width="${bEl.strokeWidth}" stroke-linecap="round" stroke-linejoin="round" />\n`;
+          });
+        } else {
+          const d = getPathData(el.nodes, el.closed);
+          const fillAttr = el.fill === 'none' ? 'none' : el.fill;
+          const opacityAttr = el.fill === 'none' ? '' : ` fill-opacity="${el.fillOpacity}"`;
+          svgContent += `  <path d="${d}" fill="${fillAttr}"${opacityAttr} stroke="${el.stroke}" stroke-width="${el.strokeWidth}" stroke-linecap="round" stroke-linejoin="round" />\n`;
+        }
       });
     });
 
@@ -2492,7 +3097,19 @@ export default function App() {
   // --- DXF DOWNLOAD GENERATOR ---
   const handleExportDXF = () => {
     const allVisibleElements = getAllElements().filter(el => el.visible);
-    const dxfContent = exportToDXF(allVisibleElements);
+    const dxfElements: PathElement[] = [];
+
+    allVisibleElements.forEach(el => {
+      const appliedBrush = el.brushId ? brushes.find(b => b.id === el.brushId) : null;
+      const deformedBrushEls = appliedBrush ? applyBrushToStroke(el, appliedBrush) : null;
+      if (deformedBrushEls && deformedBrushEls.length > 0) {
+        dxfElements.push(...deformedBrushEls);
+      } else {
+        dxfElements.push(el);
+      }
+    });
+
+    const dxfContent = exportToDXF(dxfElements);
 
     const blob = new Blob([dxfContent], { type: 'application/dxf' });
     const url = URL.createObjectURL(blob);
@@ -2507,12 +3124,13 @@ export default function App() {
   // --- PROJECT SAVE & LOAD (WORKING FILE JSON) ---
   const handleExportProject = () => {
     const projectData = {
-      version: "1.0",
+      version: "1.1",
       layers,
       activeLayerId,
       tracingImage,
       grid,
-      snapToPoints
+      snapToPoints,
+      customBrushes: brushes.filter(b => !b.isDefault),
     };
     const jsonString = JSON.stringify(projectData, null, 2);
     const blob = new Blob([jsonString], { type: 'application/json' });
@@ -2553,6 +3171,21 @@ export default function App() {
         }
         if (parsed.snapToPoints !== undefined) {
           setSnapToPoints(parsed.snapToPoints);
+        }
+
+        if (Array.isArray(parsed.customBrushes)) {
+          setBrushes(prev => {
+            const existingIds = new Set(prev.map(b => b.id));
+            const newCustom = parsed.customBrushes.filter((b: any) => !existingIds.has(b.id));
+            const merged = [...prev, ...newCustom];
+            try {
+              const customOnly = merged.filter(b => !b.isDefault);
+              localStorage.setItem('vector_brushes_library', JSON.stringify(customOnly));
+            } catch (err) {
+              console.error(err);
+            }
+            return merged;
+          });
         }
 
         // Reset selections to avoid stale references
@@ -2722,6 +3355,7 @@ export default function App() {
             <ul className="space-y-1 text-slate-500 list-disc list-inside">
               <li><strong className="text-slate-800">Pen Tool</strong>: Click to place nodes, <strong className="text-red-600">click & drag</strong> to stretch smooth handles. Click the first node to close the path!</li>
               <li><strong className="text-slate-800">Direct Select</strong>: Double-click nodes to <strong className="text-emerald-600">sharpen corner</strong> joints immediately! Drag anchors or handles to warp curves.</li>
+              <li><strong className="text-slate-800">Brush Library (Illustrator)</strong>: Save any shape as an <strong className="text-blue-600">Art Brush</strong> (stretches along stroke) or <strong className="text-emerald-600">Pattern Brush</strong> (repeats along stroke). Apply to any stroke or expand to paths!</li>
               <li><strong className="text-slate-800">Stroke to Path</strong>: Trace either side of any stroke into editable outline paths or dual boundary lines (<strong className="text-purple-600 font-mono">Ctrl+Shift+O</strong>).</li>
               <li><strong className="text-slate-800">Pathfinder Operations</strong>: Overlap shapes, select both, and click Union or Subtract to carve unique vectors.</li>
               <li><span className="text-slate-800 font-semibold">Tracing Background</span>: Drop any PNG, JPG, or SVG reference onto the canvas to draw over with precision.</li>
@@ -2764,20 +3398,65 @@ export default function App() {
             </span>
           </button>
 
-          <button
-            onClick={() => {
-              activatePenTool();
-            }}
-            className={`p-3 rounded-lg transition relative group ${
-              tool === 'pen' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
-            }`}
-            title="Pen Curve Tool (P)"
-          >
-            <PenTool size={18} />
-            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
-              bezier Pen Tool (P)
-            </span>
-          </button>
+          {/* Illustrator Pen Tools Family Button (P, +, -, Shift+C) */}
+          <div className="relative group">
+            <button
+              onClick={() => {
+                if (tool === 'pen' || tool === 'add-anchor' || tool === 'delete-anchor' || tool === 'anchor-convert') {
+                  setActiveFlyout(prev => prev === 'penTools' ? null : 'penTools');
+                } else {
+                  activatePenTool();
+                }
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setActiveFlyout('penTools');
+              }}
+              className={`p-3 rounded-lg transition relative ${
+                tool === 'pen' || tool === 'add-anchor' || tool === 'delete-anchor' || tool === 'anchor-convert'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
+              }`}
+              title="Pen Tools Family (Click to switch, right-click or click arrow for Add/Delete/Convert Tools)"
+            >
+              <div className="relative">
+                {tool === 'add-anchor' ? (
+                  <div className="relative">
+                    <PenTool size={18} />
+                    <span className="absolute -bottom-1 -right-1 bg-white text-blue-600 rounded-full w-3 h-3 flex items-center justify-center text-[10px] font-black leading-none shadow-xs">
+                      +
+                    </span>
+                  </div>
+                ) : tool === 'delete-anchor' ? (
+                  <div className="relative">
+                    <PenTool size={18} />
+                    <span className="absolute -bottom-1 -right-1 bg-white text-red-600 rounded-full w-3 h-3 flex items-center justify-center text-[10px] font-black leading-none shadow-xs">
+                      -
+                    </span>
+                  </div>
+                ) : tool === 'anchor-convert' ? (
+                  <div className="relative flex items-center justify-center w-[18px] h-[18px]">
+                    <svg className="w-[18px] h-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M5 19 L12 5 L19 19" />
+                    </svg>
+                  </div>
+                ) : (
+                  <PenTool size={18} />
+                )}
+                {/* Illustrator corner flyout triangle */}
+                <div className="absolute -bottom-1 -right-1 w-0 h-0 border-t-[3px] border-t-transparent border-r-[4px] border-r-current border-b-[3px] border-b-current opacity-80"></div>
+              </div>
+              <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+                {tool === 'add-anchor'
+                  ? 'Add Anchor Point Tool (+)'
+                  : tool === 'delete-anchor'
+                  ? 'Delete Anchor Point Tool (-)'
+                  : tool === 'anchor-convert'
+                  ? 'Anchor Point Tool (Shift+C)'
+                  : 'Pen Tool (P) - Click for Add/Delete/Convert'}
+              </span>
+            </button>
+          </div>
 
           <div className="w-8 h-[1px] bg-slate-200 my-2"></div>
 
@@ -2907,6 +3586,41 @@ export default function App() {
             </span>
           </button>
 
+          {/* Illustrator Brushes Library Flyout Button */}
+          <button
+            onClick={() => setActiveFlyout(prev => prev === 'brushes' ? null : 'brushes')}
+            className={`p-3 rounded-lg transition relative group ${
+              activeFlyout === 'brushes'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : activeBrushId || (selectedElements.length > 0 && selectedElements.some(e => e.brushId))
+                ? 'bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200'
+                : 'text-slate-500 hover:bg-slate-50 hover:text-slate-900'
+            }`}
+            title="Brush Library (Art & Pattern Brushes)"
+          >
+            <Paintbrush size={18} />
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              Brush Library (Art & Pattern Brushes)
+            </span>
+          </button>
+
+          {/* Expand into Shapes Button (Object > Expand) */}
+          <button
+            onClick={() => handleExpandToShapes()}
+            disabled={selectedElementIds.length === 0}
+            className={`p-3 rounded-lg transition relative group ${
+              selectedElementIds.length > 0
+                ? 'bg-amber-50 text-amber-600 hover:bg-amber-100 border border-amber-200 cursor-pointer shadow-xs'
+                : 'text-slate-300 hover:bg-slate-50 cursor-not-allowed'
+            }`}
+            title="Expand into Shapes (Object > Expand) [Ctrl+E]"
+          >
+            <Shapes size={18} />
+            <span className="absolute left-full ml-2 px-2 py-1 bg-slate-900 text-[10px] text-white rounded opacity-0 pointer-events-none group-hover:opacity-100 transition whitespace-nowrap z-50 shadow-md">
+              Expand into Shapes (Ctrl+E) {selectedElementIds.length === 0 ? '(Select paths)' : ''}
+            </span>
+          </button>
+
           <div className="flex-1 min-h-[20px]"></div>
 
           {/* Canvas Controls */}
@@ -2938,6 +3652,105 @@ export default function App() {
         </div>
 
         {/* --- Floating Submenus / Flyouts (placed as sibling outside the scrollable parent to prevent overflow clipping) --- */}
+        {activeFlyout === 'penTools' && (
+          <div className="absolute left-16 top-[135px] w-64 bg-white border border-slate-200 rounded-xl shadow-xl py-2 z-50 animate-in fade-in slide-in-from-left-2 duration-150">
+            <div className="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100 pb-1.5 mb-1.5 flex justify-between items-center">
+              <span>Illustrator Pen Suite</span>
+              <span className="font-mono text-[9px] text-blue-600 font-semibold">P</span>
+            </div>
+
+            <button
+              onClick={() => {
+                activatePenTool();
+                setActiveFlyout(null);
+              }}
+              className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between transition cursor-pointer ${
+                tool === 'pen' ? 'bg-blue-50 text-blue-700 font-bold' : 'hover:bg-slate-50 text-slate-700'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <PenTool size={15} className="text-blue-600 shrink-0" />
+                <div>
+                  <div className="font-semibold text-[11px]">Pen Tool</div>
+                  <div className="text-[10px] text-slate-400 font-normal">Draw and edit paths</div>
+                </div>
+              </div>
+              <span className="font-mono text-[10px] text-slate-400 font-bold">P</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setTool('add-anchor');
+                setActiveFlyout(null);
+              }}
+              className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between transition cursor-pointer ${
+                tool === 'add-anchor' ? 'bg-blue-50 text-blue-700 font-bold' : 'hover:bg-slate-50 text-slate-700'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <div className="relative shrink-0">
+                  <PenTool size={15} className="text-blue-600" />
+                  <span className="absolute -bottom-1 -right-1 bg-white text-blue-600 rounded-full w-2.5 h-2.5 flex items-center justify-center text-[9px] font-black leading-none border border-blue-200">
+                    +
+                  </span>
+                </div>
+                <div>
+                  <div className="font-semibold text-[11px]">Add Anchor Point Tool</div>
+                  <div className="text-[10px] text-slate-400 font-normal">Add nodes on path segments</div>
+                </div>
+              </div>
+              <span className="font-mono text-[10px] text-slate-400 font-bold">+</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setTool('delete-anchor');
+                setActiveFlyout(null);
+              }}
+              className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between transition cursor-pointer ${
+                tool === 'delete-anchor' ? 'bg-blue-50 text-blue-700 font-bold' : 'hover:bg-slate-50 text-slate-700'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <div className="relative shrink-0">
+                  <PenTool size={15} className="text-red-600" />
+                  <span className="absolute -bottom-1 -right-1 bg-white text-red-600 rounded-full w-2.5 h-2.5 flex items-center justify-center text-[9px] font-black leading-none border border-red-200">
+                    -
+                  </span>
+                </div>
+                <div>
+                  <div className="font-semibold text-[11px]">Delete Anchor Point Tool</div>
+                  <div className="text-[10px] text-slate-400 font-normal">Click nodes to remove</div>
+                </div>
+              </div>
+              <span className="font-mono text-[10px] text-slate-400 font-bold">-</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setTool('anchor-convert');
+                setActiveFlyout(null);
+              }}
+              className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between transition cursor-pointer ${
+                tool === 'anchor-convert' ? 'bg-blue-50 text-blue-700 font-bold' : 'hover:bg-slate-50 text-slate-700'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <div className="w-[15px] h-[15px] flex items-center justify-center shrink-0">
+                  <svg className="w-[15px] h-[15px] text-indigo-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M5 19 L12 5 L19 19" />
+                  </svg>
+                </div>
+                <div>
+                  <div className="font-semibold text-[11px]">Anchor Point Tool</div>
+                  <div className="text-[10px] text-slate-400 font-normal">Convert corner/smooth curves</div>
+                </div>
+              </div>
+              <span className="font-mono text-[10px] text-slate-400 font-bold">Shift+C</span>
+            </button>
+          </div>
+        )}
+
         {activeFlyout === 'pathfinder' && (
           <div className="absolute left-16 top-[410px] w-56 bg-white border border-slate-200 rounded-lg shadow-xl py-2 z-50 animate-in fade-in slide-in-from-left-2 duration-150">
             <div className="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider border-b border-slate-100 pb-1.5 mb-1.5 flex justify-between items-center">
@@ -3200,6 +4013,30 @@ export default function App() {
           </div>
         )}
 
+        {activeFlyout === 'brushes' && (
+          <div className="absolute left-16 top-[490px] w-72 bg-white border border-slate-200 rounded-lg shadow-xl py-3 px-3 z-50 animate-in fade-in slide-in-from-left-2 duration-150">
+            <BrushesPanel
+              brushes={brushes}
+              activeBrushId={activeBrushId}
+              selectedElement={activeSelectedElement}
+              selectedElementsCount={selectedElementIds.length}
+              onSelectBrush={(bId) => {
+                handleSelectBrush(bId);
+              }}
+              onOpenNewBrushModal={() => {
+                setActiveFlyout(null);
+                setIsBrushModalOpen(true);
+              }}
+              onDeleteBrush={handleDeleteBrush}
+              onExpandAppearance={() => {
+                handleExpandAppearance();
+                setActiveFlyout(null);
+              }}
+              strokeColor={strokeColor}
+            />
+          </div>
+        )}
+
         {/* --- Main Art Canvas Stage --- */}
         <div
           ref={canvasContainerRef}
@@ -3228,6 +4065,16 @@ export default function App() {
               <FileImage size={48} className="animate-bounce text-blue-100 mb-2" />
               <p className="font-bold text-lg">Drop your image here to load reference tracing layer</p>
               <p className="text-xs text-blue-100 mt-1">Accepts PNG, JPG, or SVG drawings</p>
+            </div>
+          )}
+
+          {/* Expand into Shapes Toast Notification */}
+          {expandToast && (
+            <div className="absolute top-6 left-1/2 -translate-x-1/2 bg-slate-900/95 text-white px-4 py-2.5 rounded-xl shadow-2xl text-xs font-semibold flex items-center gap-2.5 z-50 animate-in fade-in slide-in-from-top-3 duration-200 border border-slate-700/80">
+              <div className="p-1 rounded-md bg-amber-500/20 text-amber-400">
+                <Shapes size={15} />
+              </div>
+              <span className="text-slate-100">{expandToast}</span>
             </div>
           )}
 
@@ -3285,8 +4132,8 @@ export default function App() {
               )}
 
               {/* Center Axis Reference */}
-              <line x1="-1000" y1="300" x2="2000" y2="300" stroke="#cbd5e1" strokeWidth="0.5" strokeDasharray="4 4" className="pointer-events-none" />
-              <line x1="400" y1="-1000" x2="400" y2="2000" stroke="#cbd5e1" strokeWidth="0.5" strokeDasharray="4 4" className="pointer-events-none" />
+              <line x1="-1000" y1="300" x2="2000" y2="300" stroke="#cbd5e1" strokeWidth={0.5 / zoom} strokeDasharray={`${4 / zoom} ${4 / zoom}`} className="pointer-events-none" />
+              <line x1="400" y1="-1000" x2="400" y2="2000" stroke="#cbd5e1" strokeWidth={0.5 / zoom} strokeDasharray={`${4 / zoom} ${4 / zoom}`} className="pointer-events-none" />
 
               {/* 2. Tracing Image layer */}
               {tracingImage && tracingImage.visible && (
@@ -3319,8 +4166,8 @@ export default function App() {
                       height={350 * tracingImage.scale}
                       fill="none"
                       stroke="#2563eb"
-                      strokeWidth="2"
-                      strokeDasharray="4"
+                      strokeWidth={1.5 / zoom}
+                      strokeDasharray={`${4 / zoom} ${4 / zoom}`}
                       className="pointer-events-none"
                     />
                   )}
@@ -3337,44 +4184,83 @@ export default function App() {
 
                       const d = getPathData(el.nodes, el.closed);
                       const isSelected = selectedElementIds.includes(el.id);
+                      const appliedBrush = el.brushId ? brushes.find(b => b.id === el.brushId) : null;
+                      const deformedBrushEls = appliedBrush ? applyBrushToStroke(el, appliedBrush) : null;
 
                       return (
                         <g key={el.id} id={el.id}>
-                          {/* Inner / Fill Area path */}
-                          <path
-                            d={d}
-                            fill={el.fill}
-                            fillOpacity={el.fill === 'none' ? 0 : el.fillOpacity}
-                            stroke={isSelected ? '#2563eb' : el.stroke}
-                            strokeWidth={isSelected ? el.strokeWidth + 1.5 : el.strokeWidth}
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            onMouseDown={(e) => handleElementMouseDown(e, el.id)}
-                            className="transition-colors duration-150"
-                            style={{ cursor: el.locked ? 'default' : 'pointer' }}
-                          />
+                          {deformedBrushEls && deformedBrushEls.length > 0 ? (
+                            /* Render Brush graphics along stroke */
+                            <g
+                              onMouseDown={(e) => handleElementMouseDown(e, el.id)}
+                              style={{ cursor: el.locked ? 'default' : 'pointer' }}
+                            >
+                              {/* Optional underlying path fill if set */}
+                              {el.fill !== 'none' && (
+                                <path
+                                  d={d}
+                                  fill={el.fill}
+                                  fillOpacity={el.fillOpacity}
+                                  stroke="none"
+                                />
+                              )}
+                              {deformedBrushEls.map(bEl => {
+                                const bD = getPathData(bEl.nodes, bEl.closed);
+                                return (
+                                  <path
+                                    key={bEl.id}
+                                    d={bD}
+                                    fill={bEl.fill}
+                                    fillOpacity={bEl.fill === 'none' ? 0 : bEl.fillOpacity}
+                                    stroke={isSelected ? '#2563eb' : (bEl.stroke === 'none' ? 'none' : bEl.stroke)}
+                                    strokeWidth={isSelected ? bEl.strokeWidth + 1 : bEl.strokeWidth}
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    className="transition-colors duration-150"
+                                  />
+                                );
+                              })}
+                            </g>
+                          ) : (
+                            /* Inner / Fill Area path (Standard Vector Stroke) */
+                            <path
+                              d={d}
+                              fill={el.fill}
+                              fillOpacity={el.fill === 'none' ? 0 : el.fillOpacity}
+                              stroke={isSelected ? '#2563eb' : el.stroke}
+                              strokeWidth={isSelected ? el.strokeWidth + 1.5 : el.strokeWidth}
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              onMouseDown={(e) => handleElementMouseDown(e, el.id)}
+                              className="transition-colors duration-150"
+                              style={{ cursor: el.locked ? 'default' : 'pointer' }}
+                            />
+                          )}
 
                           {/* Selected Element boundary highlights */}
-                          {isSelected && tool === 'select' && (
+                          {isSelected && (
                             <path
                               d={d}
                               fill="none"
                               stroke="#2563eb"
-                              strokeWidth="1"
-                              strokeDasharray="4 4"
+                              strokeWidth={1 / zoom}
+                              strokeDasharray={`${4 / zoom} ${4 / zoom}`}
                               className="pointer-events-none"
                             />
                           )}
 
-                          {/* Render interactive path segments in direct-select mode */}
-                          {tool === 'direct-select' && isSelected && !el.locked && (
+                          {/* Render interactive path segments in direct-select, pen, or add-anchor mode */}
+                          {(tool === 'direct-select' || tool === 'pen' || tool === 'add-anchor') && (isSelected || tool === 'add-anchor') && !el.locked && (
                             <g>
                               {el.nodes.map((node, idx) => {
+                                if (!node || !node.anchor) return null;
                                 if (idx === el.nodes.length - 1 && !el.closed) return null;
                                 const nextIdx = idx === el.nodes.length - 1 ? 0 : idx + 1;
                                 const nextNode = el.nodes[nextIdx];
+                                if (!nextNode || !nextNode.anchor) return null;
 
                                 const segmentD = `M ${node.anchor.x} ${node.anchor.y}` + getSegmentCommand(node, nextNode);
+                                const isAddMode = tool === 'pen' || tool === 'add-anchor';
 
                                 return (
                                   <path
@@ -3382,9 +4268,14 @@ export default function App() {
                                     d={segmentD}
                                     fill="none"
                                     stroke="transparent"
-                                    strokeWidth={10}
-                                    className="hover:stroke-indigo-400/50 cursor-grab active:cursor-grabbing transition-colors duration-75"
+                                    strokeWidth={Math.max(6, 14 / zoom)}
+                                    className={`transition-colors duration-75 ${
+                                      isAddMode
+                                        ? 'hover:stroke-blue-500/50 cursor-copy'
+                                        : 'hover:stroke-indigo-400/50 cursor-grab active:cursor-grabbing'
+                                    }`}
                                     onMouseDown={(e) => handleSegmentMouseDown(e, el.id, idx, nextIdx, node, nextNode)}
+                                    title={isAddMode ? 'Click on segment to add anchor point (+)' : 'Click and drag to bend segment'}
                                   />
                                 );
                               })}
@@ -3512,14 +4403,21 @@ export default function App() {
                       : `M ${anchorStart.x} ${anchorStart.y} L ${penPreviewPos.x} ${penPreviewPos.y}`;
 
                     return (
-                      <path
-                        d={previewCmd}
-                        fill="none"
-                        stroke="#6366f1"
-                        strokeWidth="2"
-                        strokeDasharray="3 3"
-                        className="pointer-events-none"
-                      />
+                      <g className="pointer-events-none">
+                        <path
+                          d={previewCmd}
+                          fill="none"
+                          stroke="#6366f1"
+                          strokeWidth={1.5 / zoom}
+                          strokeDasharray={`${3 / zoom} ${3 / zoom}`}
+                        />
+                        <circle
+                          cx={penPreviewPos.x}
+                          cy={penPreviewPos.y}
+                          r={3 / zoom}
+                          fill="#6366f1"
+                        />
+                      </g>
                     );
                   }
                   return null;
@@ -3527,88 +4425,200 @@ export default function App() {
               )}
 
               {/* 5. Direct Select / Pen Mode: Node handles / anchor point markers */}
-              {(tool === 'direct-select' || tool === 'pen') && (
-                layers.map(layer => {
-                  if (!layer.visible) return null;
-                  return layer.elements.map(el => {
-                    if (!el.visible || !selectedElementIds.includes(el.id)) return null;
+              {(tool === 'direct-select' || tool === 'pen' || tool === 'add-anchor' || tool === 'delete-anchor' || tool === 'anchor-convert') && (
+                (() => {
+                  const nodeScale = 1 / zoom;
+                  // Crisp screen-constant anchor node dimensions (~8px on screen)
+                  const anchorSize = 8 * nodeScale;
+                  const anchorHalf = anchorSize / 2;
+                  const anchorRadius = 1.2 * nodeScale;
+                  const anchorStroke = 1.5 * nodeScale;
 
-                    return el.nodes.map((node, nodeIdx) => {
-                      const isNodeSelected = selectedNodeInfo?.nodeId === node.id;
+                  // Generous invisible hit-box so selecting/dragging anchors is effortless at any zoom
+                  const anchorHitSize = Math.max(anchorSize, 18 * nodeScale);
+                  const anchorHitHalf = anchorHitSize / 2;
 
-                      return (
-                        <g key={node.id} id={`nodes-overlay-${node.id}`}>
-                          {/* Left Handle In (Inbound tangent) */}
-                          {node.handleIn && (
-                            <g>
-                              <line
-                                x1={node.anchor.x}
-                                y1={node.anchor.y}
-                                x2={node.handleIn.x}
-                                y2={node.handleIn.y}
-                                stroke="#dc2626"
-                                strokeWidth="1.5"
-                              />
+                  // Tangent handles:
+                  const handleLineWidth = 1.2 * nodeScale;
+                  const handleRadius = 3.5 * nodeScale;
+                  const handleStroke = 1.5 * nodeScale;
+                  const handleHitRadius = Math.max(handleRadius, 9 * nodeScale);
+
+                  return layers.map(layer => {
+                    if (!layer.visible) return null;
+                    return layer.elements.map(el => {
+                      if (!el.visible || !selectedElementIds.includes(el.id)) return null;
+
+                      return el.nodes.map((node, nodeIdx) => {
+                        if (!node || !node.anchor) return null;
+                        const isNodeSelected = selectedNodeInfo?.nodeId === node.id;
+
+                        return (
+                          <g key={node.id} id={`nodes-overlay-${node.id}`}>
+                            {/* Left Handle In (Inbound tangent) */}
+                            {node.handleIn && (
+                              <g>
+                                <line
+                                  x1={node.anchor.x}
+                                  y1={node.anchor.y}
+                                  x2={node.handleIn.x}
+                                  y2={node.handleIn.y}
+                                  stroke="#dc2626"
+                                  strokeWidth={handleLineWidth}
+                                  className="pointer-events-none"
+                                />
+                                {/* Large invisible hit area for easy mouse grabbing */}
+                                <circle
+                                  cx={node.handleIn.x}
+                                  cy={node.handleIn.y}
+                                  r={handleHitRadius}
+                                  fill="transparent"
+                                  style={{ cursor: 'pointer' }}
+                                  onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'handleIn')}
+                                />
+                                {/* Visual crisp handle point that stays small when zoomed in */}
+                                <circle
+                                  cx={node.handleIn.x}
+                                  cy={node.handleIn.y}
+                                  r={handleRadius}
+                                  fill="#fff"
+                                  stroke="#dc2626"
+                                  strokeWidth={handleStroke}
+                                  className="pointer-events-none"
+                                />
+                              </g>
+                            )}
+
+                            {/* Right Handle Out (Outbound tangent) */}
+                            {node.handleOut && (
+                              <g>
+                                <line
+                                  x1={node.anchor.x}
+                                  y1={node.anchor.y}
+                                  x2={node.handleOut.x}
+                                  y2={node.handleOut.y}
+                                  stroke="#2563eb"
+                                  strokeWidth={handleLineWidth}
+                                  className="pointer-events-none"
+                                />
+                                {/* Large invisible hit area for easy mouse grabbing */}
+                                <circle
+                                  cx={node.handleOut.x}
+                                  cy={node.handleOut.y}
+                                  r={handleHitRadius}
+                                  fill="transparent"
+                                  style={{ cursor: 'pointer' }}
+                                  onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'handleOut')}
+                                />
+                                {/* Visual crisp handle point that stays small when zoomed in */}
+                                <circle
+                                  cx={node.handleOut.x}
+                                  cy={node.handleOut.y}
+                                  r={handleRadius}
+                                  fill="#fff"
+                                  stroke="#2563eb"
+                                  strokeWidth={handleStroke}
+                                  className="pointer-events-none"
+                                />
+                              </g>
+                            )}
+
+                            {/* Path-closing indicator ring when hovering near start node in pen mode */}
+                            {tool === 'pen' && activePathId === el.id && nodeIdx === 0 && !el.closed && el.nodes.length > 2 && penPreviewPos && distance(penPreviewPos, node.anchor) < 16 * nodeScale && (
                               <circle
-                                cx={node.handleIn.x}
-                                cy={node.handleIn.y}
-                                r="4"
-                                fill="#fff"
-                                stroke="#dc2626"
-                                strokeWidth="2"
-                                style={{ cursor: 'pointer' }}
-                                onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'handleIn')}
+                                cx={node.anchor.x}
+                                cy={node.anchor.y}
+                                r={7 * nodeScale}
+                                fill="none"
+                                stroke="#2563eb"
+                                strokeWidth={1.5 * nodeScale}
+                                strokeDasharray={`${2 * nodeScale} ${2 * nodeScale}`}
+                                className="pointer-events-none animate-pulse"
+                              />
+                            )}
+
+                            {/* Core Anchor Node Body */}
+                            <g>
+                              {/* Invisible hit box */}
+                              <rect
+                                x={node.anchor.x - anchorHitHalf}
+                                y={node.anchor.y - anchorHitHalf}
+                                width={anchorHitSize}
+                                height={anchorHitSize}
+                                fill="transparent"
+                                style={{
+                                  cursor:
+                                    tool === 'delete-anchor'
+                                      ? 'pointer'
+                                      : tool === 'anchor-convert'
+                                      ? 'crosshair'
+                                      : 'pointer',
+                                }}
+                                onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'anchor')}
+                                onDoubleClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSharpenNode(el.id, node.id);
+                                }}
+                                title={
+                                  tool === 'delete-anchor'
+                                    ? `Click to delete anchor ${nodeIdx + 1} (-)`
+                                    : tool === 'anchor-convert'
+                                    ? `Click: sharp corner, Drag: pull smooth handles (Shift+C)`
+                                    : `Anchor ${nodeIdx + 1} (${node.type}) - Double-click to toggle smooth/corner`
+                                }
+                              />
+                              {/* Visual anchor square (scales inversely with zoom so it never grows too big) */}
+                              <rect
+                                x={node.anchor.x - anchorHalf}
+                                y={node.anchor.y - anchorHalf}
+                                width={anchorSize}
+                                height={anchorSize}
+                                rx={anchorRadius}
+                                fill={isNodeSelected ? '#dc2626' : '#fff'}
+                                stroke={isNodeSelected ? '#dc2626' : '#2563eb'}
+                                strokeWidth={anchorStroke}
+                                className="pointer-events-none"
                               />
                             </g>
-                          )}
-
-                          {/* Right Handle Out (Outbound tangent) */}
-                          {node.handleOut && (
-                            <g>
-                              <line
-                                 x1={node.anchor.x}
-                                 y1={node.anchor.y}
-                                 x2={node.handleOut.x}
-                                 y2={node.handleOut.y}
-                                 stroke="#2563eb"
-                                 strokeWidth="1.5"
-                              />
-                              <circle
-                                 cx={node.handleOut.x}
-                                 cy={node.handleOut.y}
-                                 r="4"
-                                 fill="#fff"
-                                 stroke="#2563eb"
-                                 strokeWidth="2"
-                                 style={{ cursor: 'pointer' }}
-                                 onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'handleOut')}
-                              />
-                            </g>
-                          )}
-
-                          {/* Core Anchor Node Body (Squares for vector accuracy style) */}
-                          <rect
-                            x={node.anchor.x - 5}
-                            y={node.anchor.y - 5}
-                            width="10"
-                            height="10"
-                            rx="1.5"
-                            fill={isNodeSelected ? '#dc2626' : '#fff'}
-                            stroke={isNodeSelected ? '#dc2626' : '#2563eb'}
-                            strokeWidth="2.5"
-                            style={{ cursor: 'pointer' }}
-                            onMouseDown={(e) => handleNodeMouseDown(e, el.id, node.id, 'anchor')}
-                            onDoubleClick={(e) => {
-                              e.stopPropagation();
-                              handleSharpenNode(el.id, node.id);
-                            }}
-                            title={`Anchor ${nodeIdx + 1} (${node.type}) - Double-click to sharpen`}
-                          />
-                        </g>
-                      );
+                          </g>
+                        );
+                      });
                     });
                   });
-                })
+                })()
+              )}
+
+              {/* Segment Hover Indicator in Pen / Add Anchor Mode */}
+              {segmentHoverPreview && segmentHoverPreview.point && (
+                <g className="pointer-events-none">
+                  <circle
+                    cx={segmentHoverPreview.point.x}
+                    cy={segmentHoverPreview.point.y}
+                    r={5 / zoom}
+                    fill="#2563eb"
+                    stroke="#ffffff"
+                    strokeWidth={1.5 / zoom}
+                  />
+                  <rect
+                    x={segmentHoverPreview.point.x + 4 / zoom}
+                    y={segmentHoverPreview.point.y - 14 / zoom}
+                    width={12 / zoom}
+                    height={12 / zoom}
+                    rx={2 / zoom}
+                    fill="#2563eb"
+                  />
+                  <text
+                    x={segmentHoverPreview.point.x + 10 / zoom}
+                    y={segmentHoverPreview.point.y - 5 / zoom}
+                    fontSize={11 / zoom}
+                    fontWeight="bold"
+                    fill="#ffffff"
+                    textAnchor="middle"
+                    className="select-none"
+                  >
+                    +
+                  </text>
+                </g>
               )}
 
               {/* Selection Marquee Box */}
@@ -3788,6 +4798,28 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Expand into Shapes (Object > Expand) Quick Inspector Action */}
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => handleExpandToShapes()}
+                  disabled={selectedElementIds.length === 0}
+                  className={`w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-semibold transition shadow-xs border ${
+                    selectedElementIds.length > 0
+                      ? 'bg-amber-500 hover:bg-amber-600 text-white border-amber-600 cursor-pointer active:scale-98'
+                      : 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                  }`}
+                  title="Turn brush strokes & paths into independent, editable closed vector shapes (Ctrl+E)"
+                >
+                  <Shapes size={14} />
+                  <span>Expand into Shapes</span>
+                </button>
+                <div className="flex justify-between items-center mt-1 text-[10px] text-slate-400 px-0.5">
+                  <span>Turns paths & brushes into shapes</span>
+                  <span className="font-mono text-amber-600 font-semibold">Ctrl+E</span>
+                </div>
+              </div>
+
               {/* Active element closure toggle */}
               {activeSelectedElement && (
                 <div className="flex items-center justify-between bg-slate-50/60 p-2.5 rounded-lg border border-slate-200/80 text-[11px]">
@@ -3803,37 +4835,134 @@ export default function App() {
                 </div>
               )}
 
-              {/* Anchor Type Editor (Corner, Symmetric, Smooth) */}
-              {tool === 'direct-select' && selectedNodeInfo && getSelectedNode() && (
-                <div className="bg-slate-50/60 p-3 rounded-lg border border-slate-200/80 space-y-2">
-                  <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wide">Selected Node Anchor Type</div>
-                  <div className="grid grid-cols-3 gap-1">
-                    {(['corner', 'smooth', 'symmetric'] as NodeType[]).map((t) => {
-                      const currNode = getSelectedNode();
-                      const isActive = currNode?.type === t;
-                      return (
-                        <button
-                          key={t}
-                          onClick={() => updateSelectedNodeProperty('type', t, true)}
-                          className={`py-1 rounded text-[10px] font-semibold capitalize transition ${
-                            isActive ? 'bg-red-600 text-white shadow-sm' : 'bg-white text-slate-600 hover:bg-slate-50 border border-slate-200'
-                          }`}
-                        >
-                          {t}
-                        </button>
-                      );
-                    })}
+              {/* Illustrator Pen & Anchor Tools Inspector Widget */}
+              {selectedElementIds.length > 0 && (
+                <div className="bg-slate-50/70 p-3 rounded-lg border border-slate-200/90 space-y-2.5">
+                  <div className="flex justify-between items-center text-[10px] text-slate-400 font-bold uppercase tracking-wider">
+                    <span>Anchor & Pen Tools</span>
+                    <span className="font-mono text-[9px] text-blue-600 font-semibold">P / + / -</span>
                   </div>
-                  <p className="text-[10px] text-slate-500 leading-tight">
-                    * Smooth / Symmetric automatically balance control points symmetrically over the anchor node.
-                  </p>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setTool('add-anchor')}
+                      className={`py-1.5 px-2 rounded-md text-[11px] font-semibold flex items-center justify-center gap-1.5 transition border cursor-pointer ${
+                        tool === 'add-anchor'
+                          ? 'bg-blue-600 text-white border-blue-700 shadow-xs'
+                          : 'bg-white text-slate-700 hover:bg-slate-50 border-slate-200'
+                      }`}
+                      title="Add Anchor Point Tool: click any path segment to insert a node (+)"
+                    >
+                      <Plus size={13} className={tool === 'add-anchor' ? 'text-white' : 'text-blue-600'} />
+                      <span>Add Node (+)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (selectedNodeInfo) {
+                          handleDeleteNode(selectedNodeInfo.elementId, selectedNodeInfo.nodeId);
+                        } else {
+                          setTool('delete-anchor');
+                        }
+                      }}
+                      className={`py-1.5 px-2 rounded-md text-[11px] font-semibold flex items-center justify-center gap-1.5 transition border cursor-pointer ${
+                        tool === 'delete-anchor'
+                          ? 'bg-red-600 text-white border-red-700 shadow-xs'
+                          : 'bg-white text-slate-700 hover:bg-slate-50 border-slate-200'
+                      }`}
+                      title="Delete Anchor Point Tool: click an anchor to remove it (-)"
+                    >
+                      <Minus size={13} className={tool === 'delete-anchor' ? 'text-white' : 'text-red-600'} />
+                      <span>Delete Node (-)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTool('anchor-convert');
+                      }}
+                      className={`py-1.5 px-2 rounded-md text-[11px] font-semibold flex items-center justify-center gap-1.5 transition border cursor-pointer ${
+                        tool === 'anchor-convert'
+                          ? 'bg-indigo-600 text-white border-indigo-700 shadow-xs'
+                          : 'bg-white text-slate-700 hover:bg-slate-50 border-slate-200'
+                      }`}
+                      title="Anchor Point Tool: click to sharpen corner, drag to pull smooth handles (Shift+C)"
+                    >
+                      <svg className="w-3.5 h-3.5 text-indigo-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M5 19 L12 5 L19 19" />
+                      </svg>
+                      <span>Convert (Shift+C)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleAddAnchorPointsToPath()}
+                      className="py-1.5 px-2 rounded-md text-[11px] font-semibold flex items-center justify-center gap-1.5 bg-white text-slate-700 hover:bg-slate-50 border border-slate-200 transition cursor-pointer"
+                      title="Illustrator Object > Path > Add Anchor Points: subdivides all segments with midpoint nodes"
+                    >
+                      <Sparkles size={12} className="text-amber-500" />
+                      <span>Subdivide Path</span>
+                    </button>
+                  </div>
+
+                  {/* Selected Node Anchor Type Toggle if an anchor is selected */}
+                  {selectedNodeInfo && getSelectedNode() && (
+                    <div className="pt-1.5 border-t border-slate-200/80">
+                      <div className="text-[10px] text-slate-400 font-semibold mb-1">Selected Anchor Type:</div>
+                      <div className="grid grid-cols-3 gap-1">
+                        {(['corner', 'smooth', 'symmetric'] as NodeType[]).map((t) => {
+                          const currNode = getSelectedNode();
+                          const isActive = currNode?.type === t;
+                          return (
+                            <button
+                              key={t}
+                              type="button"
+                              onClick={() => {
+                                if (t === 'corner') {
+                                  handleConvertNode(selectedNodeInfo.elementId, selectedNodeInfo.nodeId, 'corner');
+                                } else {
+                                  handleConvertNode(selectedNodeInfo.elementId, selectedNodeInfo.nodeId, 'smooth');
+                                }
+                              }}
+                              className={`py-1 rounded text-[10px] font-semibold capitalize transition ${
+                                isActive ? 'bg-blue-600 text-white shadow-xs' : 'bg-white text-slate-600 hover:bg-slate-50 border border-slate-200'
+                              }`}
+                            >
+                              {t}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
             </div>
           </div>
 
-
+          {/* Section: Illustrator Brushes Library */}
+          <div className="p-4 border-b border-slate-200/80">
+            <BrushesPanel
+              brushes={brushes}
+              activeBrushId={activeBrushId}
+              selectedElement={activeSelectedElement}
+              selectedElementsCount={selectedElementIds.length}
+              onSelectBrush={(bId) => {
+                handleSelectBrush(bId);
+              }}
+              onOpenNewBrushModal={() => {
+                setIsBrushModalOpen(true);
+              }}
+              onDeleteBrush={handleDeleteBrush}
+              onExpandAppearance={() => {
+                handleExpandAppearance();
+              }}
+              strokeColor={strokeColor}
+            />
+          </div>
 
           {/* Section: Tracing Image Parameters and Opacity */}
           {tracingImage && (
@@ -4090,9 +5219,9 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-3 text-right">
-          {tool === 'pen' ? (
+          {tool === 'pen' || tool === 'add-anchor' || tool === 'delete-anchor' || tool === 'anchor-convert' ? (
             <span className="hidden md:inline text-[10px] text-slate-600">
-              Shift: 45° snap | Ctrl+Click: deselect/direct-select | Alt: convert anchor / break handles | 2x-click: smooth/corner
+              P: Pen | +: Add node on path | -: Delete node | Shift+C: Convert anchor | Alt: break handles | Shift: 45°
             </span>
           ) : tool === 'rect' || tool === 'ellipse' || tool === 'triangle' || tool === 'spiral' ? (
             <span className="hidden md:inline text-[10px] text-slate-600">
@@ -4100,7 +5229,7 @@ export default function App() {
             </span>
           ) : (
             <span className="hidden md:inline text-[10px] text-slate-400">
-              Ctrl+Shift+O: stroke to path | Middle-click/Wheel: pan canvas | Mouse wheel: zoom | Ctrl+Z / Ctrl+Y: undo/redo
+              Ctrl+E: expand to shapes | Ctrl+Shift+O: stroke to path | Middle-click: pan | Wheel: zoom | Ctrl+Z/Y: undo/redo
             </span>
           )}
           <span className="text-[10px] text-slate-400">
@@ -4108,6 +5237,15 @@ export default function App() {
           </span>
         </div>
       </footer>
+
+      {/* --- Illustrator New Brush Setup Modal --- */}
+      <BrushModal
+        isOpen={isBrushModalOpen}
+        onClose={() => setIsBrushModalOpen(false)}
+        selectedElements={selectedElements}
+        onSaveBrush={handleSaveNewBrush}
+        activeStrokeColor={strokeColor}
+      />
     </div>
   );
 }

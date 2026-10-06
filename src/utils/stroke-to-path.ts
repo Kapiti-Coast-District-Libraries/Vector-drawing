@@ -169,7 +169,7 @@ function samplePathWithNormals(element: PathElement): SampledPoint[] {
 /**
  * Standard Ramer-Douglas-Peucker polygon reduction algorithm
  */
-function simplifyPoints(points: Point[], epsilon = 0.8): Point[] {
+export function simplifyPoints(points: Point[], epsilon = 0.8): Point[] {
   if (points.length <= 2) return points;
 
   let maxDist = 0;
@@ -218,7 +218,7 @@ function simplifyPoints(points: Point[], epsilon = 0.8): Point[] {
 /**
  * Generates smooth Bezier handles for simplified polygon vertices
  */
-function pointsToVectorNodes(points: Point[], closed = true): VectorNode[] {
+export function pointsToVectorNodes(points: Point[], closed = true): VectorNode[] {
   if (points.length === 0) return [];
   if (points.length <= 2) {
     return points.map(pt => ({

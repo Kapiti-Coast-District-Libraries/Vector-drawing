@@ -14,6 +14,7 @@ export function getElementBoundingBox(element: PathElement) {
   let maxY = -Infinity;
 
   element.nodes.forEach(node => {
+    if (!node || !node.anchor) return;
     // Check anchor
     minX = Math.min(minX, node.anchor.x);
     maxX = Math.max(maxX, node.anchor.x);

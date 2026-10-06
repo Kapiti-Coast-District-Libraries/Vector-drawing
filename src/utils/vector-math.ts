@@ -23,18 +23,20 @@ export function sampleCurve(p0: Point, p1: Point, p2: Point, p3: Point, samples 
 }
 
 export function getPathData(nodes: VectorNode[], closed: boolean): string {
-  if (nodes.length === 0) return '';
-  let d = `M ${nodes[0].anchor.x} ${nodes[0].anchor.y}`;
+  if (!nodes || nodes.length === 0) return '';
+  const validNodes = nodes.filter(n => n && n.anchor);
+  if (validNodes.length === 0) return '';
+  let d = `M ${validNodes[0].anchor.x} ${validNodes[0].anchor.y}`;
 
-  for (let i = 0; i < nodes.length - 1; i++) {
-    const current = nodes[i];
-    const next = nodes[i + 1];
+  for (let i = 0; i < validNodes.length - 1; i++) {
+    const current = validNodes[i];
+    const next = validNodes[i + 1];
     d += getSegmentCommand(current, next);
   }
 
-  if (closed && nodes.length > 1) {
-    const last = nodes[nodes.length - 1];
-    const first = nodes[0];
+  if (closed && validNodes.length > 1) {
+    const last = validNodes[validNodes.length - 1];
+    const first = validNodes[0];
     d += getSegmentCommand(last, first);
     d += ' Z';
   }
@@ -43,6 +45,7 @@ export function getPathData(nodes: VectorNode[], closed: boolean): string {
 }
 
 export function getSegmentCommand(fromNode: VectorNode, toNode: VectorNode): string {
+  if (!fromNode?.anchor || !toNode?.anchor) return '';
   const h1 = fromNode.handleOut;
   const h2 = toNode.handleIn;
 
@@ -296,4 +299,185 @@ export function snapAngle45(origin: Point, target: Point): Point {
     x: origin.x + Math.cos(snappedAngle) * dist,
     y: origin.y + Math.sin(snappedAngle) * dist,
   };
+}
+
+export interface SplitSegmentResult {
+  splitPoint: Point;
+  t: number;
+  prevNodeHandleOut?: Point;
+  newNode: VectorNode;
+  nextNodeHandleIn?: Point;
+}
+
+/**
+ * Mathematically exact de Casteljau curve subdivision.
+ * Splits a straight line or cubic Bezier segment at the clicked coordinate
+ * without distorting the shape by even a single subpixel.
+ */
+export function splitSegmentAtPoint(
+  nodeA: VectorNode,
+  nodeB: VectorNode,
+  clickPt: Point
+): SplitSegmentResult {
+  const p0 = nodeA?.anchor || { x: 0, y: 0 };
+  const p3 = nodeB?.anchor || { x: 0, y: 0 };
+  const ptToMatch = clickPt || p0;
+  const isCurved = !!(nodeA.handleOut || nodeB.handleIn);
+
+  if (!isCurved) {
+    // Linear segment: projection onto line
+    const dx = p3.x - p0.x;
+    const dy = p3.y - p0.y;
+    const lenSq = dx * dx + dy * dy;
+    let t = 0.5;
+    if (lenSq > 1e-6) {
+      t = Math.max(0.02, Math.min(0.98, ((ptToMatch.x - p0.x) * dx + (ptToMatch.y - p0.y) * dy) / lenSq));
+    }
+    const splitPoint: Point = {
+      x: p0.x + t * dx,
+      y: p0.y + t * dy,
+    };
+    return {
+      splitPoint,
+      t,
+      prevNodeHandleOut: undefined,
+      newNode: {
+        id: `node-${Math.random().toString(36).substr(2, 9)}`,
+        anchor: splitPoint,
+        type: 'corner',
+      },
+      nextNodeHandleIn: undefined,
+    };
+  }
+
+  // Cubic Bezier curve segment
+  const p1 = nodeA.handleOut || p0;
+  const p2 = nodeB.handleIn || p3;
+
+  // Sample along curve to find initial best t
+  const steps = 64;
+  let bestT = 0.5;
+  let bestDistSq = Infinity;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const pt = getCubicBezierPoint(t, p0, p1, p2, p3);
+    const dSq = (pt.x - ptToMatch.x) ** 2 + (pt.y - ptToMatch.y) ** 2;
+    if (dSq < bestDistSq) {
+      bestDistSq = dSq;
+      bestT = t;
+    }
+  }
+
+  // Refine with golden-ratio / interval search
+  let tMin = Math.max(0.01, bestT - 1 / steps);
+  let tMax = Math.min(0.99, bestT + 1 / steps);
+  for (let iter = 0; iter < 8; iter++) {
+    const t1 = tMin + (tMax - tMin) * 0.382;
+    const t2 = tMin + (tMax - tMin) * 0.618;
+    const pt1 = getCubicBezierPoint(t1, p0, p1, p2, p3);
+    const pt2 = getCubicBezierPoint(t2, p0, p1, p2, p3);
+    const d1 = (pt1.x - ptToMatch.x) ** 2 + (pt1.y - ptToMatch.y) ** 2;
+    const d2 = (pt2.x - ptToMatch.x) ** 2 + (pt2.y - ptToMatch.y) ** 2;
+    if (d1 < d2) {
+      tMax = t2;
+    } else {
+      tMin = t1;
+    }
+  }
+  const t = Math.max(0.02, Math.min(0.98, (tMin + tMax) / 2));
+  const mt = 1 - t;
+
+  // de Casteljau subdivision:
+  const a = { x: mt * p0.x + t * p1.x, y: mt * p0.y + t * p1.y };
+  const b = { x: mt * p1.x + t * p2.x, y: mt * p1.y + t * p2.y };
+  const c = { x: mt * p2.x + t * p3.x, y: mt * p2.y + t * p3.y };
+
+  const d = { x: mt * a.x + t * b.x, y: mt * a.y + t * b.y };
+  const e = { x: mt * b.x + t * c.x, y: mt * b.y + t * c.y };
+
+  const f = { x: mt * d.x + t * e.x, y: mt * d.y + t * e.y };
+
+  return {
+    splitPoint: f,
+    t,
+    prevNodeHandleOut: a,
+    newNode: {
+      id: `node-${Math.random().toString(36).substr(2, 9)}`,
+      anchor: f,
+      handleIn: d,
+      handleOut: e,
+      type: 'smooth',
+    },
+    nextNodeHandleIn: c,
+  };
+}
+
+/**
+ * Finds which path segment on an element is nearest to the cursor
+ */
+export function findNearestSegmentOnElement(
+  el: PathElement,
+  clickPt: Point,
+  threshold = 16
+): { segmentIdx: number; nextSegmentIdx: number; distance: number; projection: Point } | null {
+  if (!el.nodes || el.nodes.length < 2) return null;
+
+  let bestDist = threshold;
+  let bestResult: { segmentIdx: number; nextSegmentIdx: number; distance: number; projection: Point } | null = null;
+
+  const segCount = el.closed ? el.nodes.length : el.nodes.length - 1;
+
+  for (let i = 0; i < segCount; i++) {
+    const nextI = (i + 1) % el.nodes.length;
+    const n1 = el.nodes[i];
+    const n2 = el.nodes[nextI];
+    if (!n1?.anchor || !n2?.anchor) continue;
+
+    const isCurved = !!(n1.handleOut || n2.handleIn);
+    if (!isCurved) {
+      // Line distance
+      const dx = n2.anchor.x - n1.anchor.x;
+      const dy = n2.anchor.y - n1.anchor.y;
+      const lenSq = dx * dx + dy * dy;
+      let t = 0;
+      if (lenSq > 1e-6) {
+        t = Math.max(0, Math.min(1, ((clickPt.x - n1.anchor.x) * dx + (clickPt.y - n1.anchor.y) * dy) / lenSq));
+      }
+      const projX = n1.anchor.x + t * dx;
+      const projY = n1.anchor.y + t * dy;
+      const dist = Math.hypot(clickPt.x - projX, clickPt.y - projY);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestResult = {
+          segmentIdx: i,
+          nextSegmentIdx: nextI,
+          distance: dist,
+          projection: { x: projX, y: projY },
+        };
+      }
+    } else {
+      // Curve distance
+      const p0 = n1.anchor;
+      const p1 = n1.handleOut || p0;
+      const p2 = n2.handleIn || n2.anchor;
+      const p3 = n2.anchor;
+
+      const samples = 32;
+      for (let s = 0; s <= samples; s++) {
+        const pt = getCubicBezierPoint(s / samples, p0, p1, p2, p3);
+        const dist = Math.hypot(clickPt.x - pt.x, clickPt.y - pt.y);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestResult = {
+            segmentIdx: i,
+            nextSegmentIdx: nextI,
+            distance: dist,
+            projection: pt,
+          };
+        }
+      }
+    }
+  }
+
+  return bestResult;
 }

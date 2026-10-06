@@ -26,6 +26,30 @@ export interface PathElement {
   strokeDashArray?: string;
   visible: boolean;
   locked: boolean;
+  brushId?: string; // id of applied brush, if any
+}
+
+export type BrushType = 'art' | 'pattern';
+
+export interface BrushOptions {
+  direction: 'left-to-right' | 'right-to-left';
+  stretchMode?: 'stretch-to-fit' | 'proportional';
+  spacing?: number; // Spacing factor for pattern brush (e.g. 1.0 = adjacent, 1.5 = spaced)
+  flipAcross?: boolean; // Flip across the stroke axis (vertical)
+  flipAlong?: boolean;  // Flip along stroke direction (horizontal)
+  colorMode: 'tints' | 'original'; // 'tints' = recolor with stroke color; 'original' = maintain original colors
+  scale: number; // thickness / scale multiplier, default 1.0
+}
+
+export interface BrushDefinition {
+  id: string;
+  name: string;
+  type: BrushType;
+  elements: PathElement[];
+  options: BrushOptions;
+  thumbnailSvg?: string;
+  isDefault?: boolean;
+  createdAt?: number;
 }
 
 export interface Layer {
@@ -49,7 +73,18 @@ export interface TracingImage {
   locked: boolean;
 }
 
-export type ToolType = 'select' | 'direct-select' | 'pen' | 'rect' | 'ellipse' | 'triangle' | 'spiral' | 'eraser';
+export type ToolType =
+  | 'select'
+  | 'direct-select'
+  | 'pen'
+  | 'add-anchor'
+  | 'delete-anchor'
+  | 'anchor-convert'
+  | 'rect'
+  | 'ellipse'
+  | 'triangle'
+  | 'spiral'
+  | 'eraser';
 
 export interface GridConfig {
   size: number;
