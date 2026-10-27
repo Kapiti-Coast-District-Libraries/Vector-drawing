@@ -11,12 +11,13 @@ export interface VectorNode {
   handleIn?: Point;  // Absolute coordinates. If undefined, no handle on left.
   handleOut?: Point; // Absolute coordinates. If undefined, no handle on right.
   type: NodeType;
+  subpathStart?: boolean;
 }
 
 export interface PathElement {
   id: string;
   name: string;
-  type: 'path' | 'rect' | 'ellipse' | 'polygon';
+  type: 'path' | 'rect' | 'ellipse' | 'polygon' | 'text';
   nodes: VectorNode[];
   closed: boolean;
   fill: string;        // hex or "none"
@@ -27,6 +28,13 @@ export interface PathElement {
   visible: boolean;
   locked: boolean;
   brushId?: string; // id of applied brush, if any
+  text?: string;
+  fontSize?: number;
+  fontFamily?: string;
+  fontWeight?: string | number;
+  fontStyle?: string;
+  textAlign?: 'left' | 'center' | 'right';
+  letterSpacing?: number;
 }
 
 export type BrushType = 'art' | 'pattern';
@@ -84,7 +92,8 @@ export type ToolType =
   | 'ellipse'
   | 'triangle'
   | 'spiral'
-  | 'eraser';
+  | 'eraser'
+  | 'text';
 
 export interface GridConfig {
   size: number;
@@ -103,3 +112,5 @@ export interface AlignmentGuide {
   minVal: number;
   maxVal: number;
 }
+
+export type UnitType = 'mm' | 'cm' | 'in' | 'px';

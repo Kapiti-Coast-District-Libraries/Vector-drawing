@@ -26,20 +26,51 @@ export function getPathData(nodes: VectorNode[], closed: boolean): string {
   if (!nodes || nodes.length === 0) return '';
   const validNodes = nodes.filter(n => n && n.anchor);
   if (validNodes.length === 0) return '';
-  let d = `M ${validNodes[0].anchor.x} ${validNodes[0].anchor.y}`;
 
-  for (let i = 0; i < validNodes.length - 1; i++) {
-    const current = validNodes[i];
-    const next = validNodes[i + 1];
-    d += getSegmentCommand(current, next);
+  const hasMultipleSubpaths = validNodes.some((n, idx) => idx > 0 && n.subpathStart);
+
+  if (!hasMultipleSubpaths) {
+    let d = `M ${validNodes[0].anchor.x} ${validNodes[0].anchor.y}`;
+    for (let i = 0; i < validNodes.length - 1; i++) {
+      const current = validNodes[i];
+      const next = validNodes[i + 1];
+      d += getSegmentCommand(current, next);
+    }
+    if (closed && validNodes.length > 1) {
+      const last = validNodes[validNodes.length - 1];
+      const first = validNodes[0];
+      d += getSegmentCommand(last, first);
+      d += ' Z';
+    }
+    return d;
   }
 
-  if (closed && validNodes.length > 1) {
-    const last = validNodes[validNodes.length - 1];
-    const first = validNodes[0];
-    d += getSegmentCommand(last, first);
-    d += ' Z';
+  // Compound multi-contour path (e.g. letters with holes like 'O', 'e', 'B')
+  let d = '';
+  let currentSubpath: VectorNode[] = [];
+
+  const appendSubpath = (sub: VectorNode[]) => {
+    if (sub.length === 0) return;
+    d += `${d ? ' ' : ''}M ${sub[0].anchor.x} ${sub[0].anchor.y}`;
+    for (let i = 0; i < sub.length - 1; i++) {
+      d += getSegmentCommand(sub[i], sub[i + 1]);
+    }
+    if (closed && sub.length > 1) {
+      d += getSegmentCommand(sub[sub.length - 1], sub[0]);
+      d += ' Z';
+    }
+  };
+
+  for (let i = 0; i < validNodes.length; i++) {
+    const node = validNodes[i];
+    if (node.subpathStart && currentSubpath.length > 0) {
+      appendSubpath(currentSubpath);
+      currentSubpath = [node];
+    } else {
+      currentSubpath.push(node);
+    }
   }
+  appendSubpath(currentSubpath);
 
   return d;
 }
@@ -59,83 +90,106 @@ export function getSegmentCommand(fromNode: VectorNode, toNode: VectorNode): str
 }
 
 // Convert path elements into polygon rings compatible with polygon-clipping.
-// Each polygon is Array<Array<[number, number]>> (ring list).
+// Each polygon is Array<Array<[number, number]>> (ring list: outer ring + hole rings).
 export function pathElementToPolygonCoords(element: PathElement): [number, number][][] {
   if (element.nodes.length < 2) return [];
-  const coords: [number, number][] = [];
-  const nodes = element.nodes;
 
-  for (let i = 0; i < nodes.length - 1; i++) {
-    const current = nodes[i];
-    const next = nodes[i + 1];
-    const h1 = current.handleOut;
-    const h2 = next.handleIn;
+  // Group nodes by subpath (split on node.subpathStart)
+  const subpaths: VectorNode[][] = [];
+  let currentSubpath: VectorNode[] = [];
 
-    if (h1 || h2) {
-      const cp1 = h1 || current.anchor;
-      const cp2 = h2 || next.anchor;
-      const sampled = sampleCurve(current.anchor, cp1, cp2, next.anchor, 14);
-      const startIdx = coords.length === 0 ? 0 : 1;
-      for (let j = startIdx; j < sampled.length; j++) {
-        coords.push([sampled[j].x, sampled[j].y]);
-      }
+  for (let i = 0; i < element.nodes.length; i++) {
+    const node = element.nodes[i];
+    if (i > 0 && node.subpathStart && currentSubpath.length > 0) {
+      subpaths.push(currentSubpath);
+      currentSubpath = [node];
     } else {
-      if (coords.length === 0) {
-        coords.push([current.anchor.x, current.anchor.y]);
-      }
-      coords.push([next.anchor.x, next.anchor.y]);
+      currentSubpath.push(node);
     }
   }
-
-  // Handle closure segment back to start
-  if (nodes.length > 1) {
-    const last = nodes[nodes.length - 1];
-    const first = nodes[0];
-    const h1 = last.handleOut;
-    const h2 = first.handleIn;
-
-    if (h1 || h2) {
-      const cp1 = h1 || last.anchor;
-      const cp2 = h2 || first.anchor;
-      const sampled = sampleCurve(last.anchor, cp1, cp2, first.anchor, 14);
-      for (let j = 1; j < sampled.length; j++) {
-        coords.push([sampled[j].x, sampled[j].y]);
-      }
-    } else {
-      coords.push([first.anchor.x, first.anchor.y]);
-    }
+  if (currentSubpath.length > 0) {
+    subpaths.push(currentSubpath);
   }
 
-  // Clean successive degenerate vertices
-  const cleaned: [number, number][] = [];
-  for (const c of coords) {
-    if (cleaned.length === 0) {
-      cleaned.push(c);
-    } else {
-      const last = cleaned[cleaned.length - 1];
-      const dist = Math.hypot(last[0] - c[0], last[1] - c[1]);
-      if (dist > 0.1) {
+  const allRings: [number, number][][] = [];
+
+  for (const nodes of subpaths) {
+    if (nodes.length < 2) continue;
+    const coords: [number, number][] = [];
+
+    for (let i = 0; i < nodes.length - 1; i++) {
+      const current = nodes[i];
+      const next = nodes[i + 1];
+      const h1 = current.handleOut;
+      const h2 = next.handleIn;
+
+      if (h1 || h2) {
+        const cp1 = h1 || current.anchor;
+        const cp2 = h2 || next.anchor;
+        const sampled = sampleCurve(current.anchor, cp1, cp2, next.anchor, 14);
+        const startIdx = coords.length === 0 ? 0 : 1;
+        for (let j = startIdx; j < sampled.length; j++) {
+          coords.push([sampled[j].x, sampled[j].y]);
+        }
+      } else {
+        if (coords.length === 0) {
+          coords.push([current.anchor.x, current.anchor.y]);
+        }
+        coords.push([next.anchor.x, next.anchor.y]);
+      }
+    }
+
+    // Handle closure segment back to start
+    if (nodes.length > 1) {
+      const last = nodes[nodes.length - 1];
+      const first = nodes[0];
+      const h1 = last.handleOut;
+      const h2 = first.handleIn;
+
+      if (h1 || h2) {
+        const cp1 = h1 || last.anchor;
+        const cp2 = h2 || first.anchor;
+        const sampled = sampleCurve(last.anchor, cp1, cp2, first.anchor, 14);
+        for (let j = 1; j < sampled.length; j++) {
+          coords.push([sampled[j].x, sampled[j].y]);
+        }
+      } else {
+        coords.push([first.anchor.x, first.anchor.y]);
+      }
+    }
+
+    // Clean successive degenerate vertices
+    const cleaned: [number, number][] = [];
+    for (const c of coords) {
+      if (cleaned.length === 0) {
         cleaned.push(c);
+      } else {
+        const last = cleaned[cleaned.length - 1];
+        const dist = Math.hypot(last[0] - c[0], last[1] - c[1]);
+        if (dist > 0.1) {
+          cleaned.push(c);
+        }
       }
     }
-  }
 
-  // Remove duplicate close endpoint
-  if (cleaned.length > 2) {
-    const first = cleaned[0];
-    const last = cleaned[cleaned.length - 1];
-    const dist = Math.hypot(first[0] - last[0], first[1] - last[1]);
-    if (dist < 0.2) {
-      cleaned.pop();
+    // Remove duplicate close endpoint
+    if (cleaned.length > 2) {
+      const first = cleaned[0];
+      const last = cleaned[cleaned.length - 1];
+      const dist = Math.hypot(first[0] - last[0], first[1] - last[1]);
+      if (dist < 0.2) {
+        cleaned.pop();
+      }
+    }
+
+    // polygon-clipping expects ring to start and end at the same point (explicit closing)
+    if (cleaned.length > 2) {
+      cleaned.push([cleaned[0][0], cleaned[0][1]]);
+      allRings.push(cleaned);
     }
   }
 
-  // polygon-clipping expects ring to start and end at the same point (explicit closing)
-  if (cleaned.length > 2) {
-    cleaned.push([cleaned[0][0], cleaned[0][1]]);
-    return [cleaned];
-  }
-  return [];
+  return allRings;
 }
 
 // Perform Pathfinder Operations
@@ -153,7 +207,7 @@ export function performPathfinder(
 
   try {
     if (operation === 'union') {
-      result = clipper.union(shapes[0] as any, ...shapes.slice(1) as any);
+      result = clipper.union(shapes[0] as any, ...(shapes.slice(1) as any));
     } else if (operation === 'subtract') {
       let current = shapes[0] as any;
       for (let i = 1; i < shapes.length; i++) {
@@ -180,35 +234,64 @@ export function performPathfinder(
 
   if (!result || result.length === 0) return null;
 
-  // Convert Multipolygon coordinates back to a custom closed PathElement.
-  // Each Multipolygon is: Array<Array<Array<[number, number]>>> (poly -> rings -> coords).
-  // We can merge the paths into a single path element if multiple rings exist, OR create a single merged list of nodes.
-  // For a clean implementation, let's take the first main outer ring and convert it back to a series of nodes.
-  // This guarantees simple editing for kids!
-  const poly = result[0]; // first polygon
-  if (!poly || poly.length === 0) return null;
-
-  const outerRing = poly[0]; // first ring is the outer boundary
-  if (!outerRing || outerRing.length < 3) return null;
-
-  // Convert ring back to VectorNode list.
-  // We can simplify or keep it as-is. In a simple setup, each point can be a node (no handles initially, corner nodes).
-  // This lets kids immediately edit or smooth them themselves!
   const strokeColor = elements[0].stroke;
   const fillColor = elements[0].fill !== 'none' ? elements[0].fill : '#3b82f6';
 
-  // Map outerRing back to nodes. Note: outerRing's last coordinate matches his first. We exclude it to avoid redundant point.
+  // Convert all polygons and rings into clean VectorNodes with subpathStart
   const nodes: VectorNode[] = [];
-  const limit = outerRing.length - 1; // skip final closing duplicate point
 
-  for (let i = 0; i < limit; i++) {
-    const pt = outerRing[i];
-    nodes.push({
-      id: `node-${Math.random().toString(36).substr(2, 9)}`,
-      anchor: { x: pt[0], y: pt[1] },
-      type: 'corner'
-    });
+  for (const poly of result) {
+    for (const ring of poly) {
+      if (!ring || ring.length < 4) continue;
+      // Exclude final duplicate closing point
+      const pts = ring.slice(0, -1);
+      const count = pts.length;
+
+      for (let i = 0; i < count; i++) {
+        const curr = { x: pts[i][0], y: pts[i][1] };
+        const prev = { x: pts[(i - 1 + count) % count][0], y: pts[(i - 1 + count) % count][1] };
+        const next = { x: pts[(i + 1) % count][0], y: pts[(i + 1) % count][1] };
+
+        const d1x = curr.x - prev.x;
+        const d1y = curr.y - prev.y;
+        const d2x = next.x - curr.x;
+        const d2y = next.y - curr.y;
+        const l1 = Math.hypot(d1x, d1y) || 1;
+        const l2 = Math.hypot(d2x, d2y) || 1;
+        const dot = (d1x * d2x + d1y * d2y) / (l1 * l2);
+
+        const isSubStart = (i === 0);
+
+        if (dot < 0.6) {
+          nodes.push({
+            id: `node-${Math.random().toString(36).substr(2, 9)}`,
+            anchor: curr,
+            type: 'corner',
+            subpathStart: isSubStart ? true : undefined,
+          });
+        } else {
+          const tanX = next.x - prev.x;
+          const tanY = next.y - prev.y;
+          const tanLen = Math.hypot(tanX, tanY) || 1;
+          const ux = tanX / tanLen;
+          const uy = tanY / tanLen;
+          const hLen1 = Math.min(l1 * 0.35, 20);
+          const hLen2 = Math.min(l2 * 0.35, 20);
+
+          nodes.push({
+            id: `node-${Math.random().toString(36).substr(2, 9)}`,
+            anchor: curr,
+            handleIn: { x: curr.x - ux * hLen1, y: curr.y - uy * hLen1 },
+            handleOut: { x: curr.x + ux * hLen2, y: curr.y + uy * hLen2 },
+            type: 'smooth',
+            subpathStart: isSubStart ? true : undefined,
+          });
+        }
+      }
+    }
   }
+
+  if (nodes.length < 3) return null;
 
   return {
     id: `path-${Math.random().toString(36).substr(2, 9)}`,
@@ -480,4 +563,279 @@ export function findNearestSegmentOnElement(
   }
 
   return bestResult;
+}
+
+/**
+ * Snaps a target point to strictly horizontal or vertical relative to an origin point (90° right angle to page).
+ */
+export function snapPointOrthogonal(origin: Point, target: Point): Point {
+  const dx = target.x - origin.x;
+  const dy = target.y - origin.y;
+  if (Math.abs(dx) > Math.abs(dy)) {
+    return { x: target.x, y: origin.y };
+  } else {
+    return { x: origin.x, y: target.y };
+  }
+}
+
+/**
+ * Snaps a single node to form a perfect 90° right angle (horizontal or vertical) with its adjacent connected node(s).
+ */
+export function snapNodeToRightAngleWithAdjacent(element: PathElement, nodeId: string): PathElement {
+  const nodeIdx = element.nodes.findIndex(n => n.id === nodeId);
+  if (nodeIdx === -1) return element;
+  const newNodes = element.nodes.map(n => ({ ...n, anchor: { ...n.anchor } }));
+  const currNode = newNodes[nodeIdx];
+
+  const prevNode = nodeIdx > 0 ? newNodes[nodeIdx - 1] : (element.closed ? newNodes[newNodes.length - 1] : null);
+  const nextNode = nodeIdx < newNodes.length - 1 ? newNodes[nodeIdx + 1] : (element.closed ? newNodes[0] : null);
+
+  const refNode = prevNode || nextNode;
+  if (!refNode) return element;
+
+  const dx = Math.abs(currNode.anchor.x - refNode.anchor.x);
+  const dy = Math.abs(currNode.anchor.y - refNode.anchor.y);
+
+  if (dx < dy) {
+    // Closer to vertical: align X coordinate for a 90° vertical line segment
+    currNode.anchor.x = refNode.anchor.x;
+    if (currNode.handleIn) currNode.handleIn = { ...currNode.handleIn, x: refNode.anchor.x };
+    if (currNode.handleOut) currNode.handleOut = { ...currNode.handleOut, x: refNode.anchor.x };
+  } else {
+    // Closer to horizontal: align Y coordinate for a 0° horizontal line segment
+    currNode.anchor.y = refNode.anchor.y;
+    if (currNode.handleIn) currNode.handleIn = { ...currNode.handleIn, y: refNode.anchor.y };
+    if (currNode.handleOut) currNode.handleOut = { ...currNode.handleOut, y: refNode.anchor.y };
+  }
+
+  return { ...element, nodes: newNodes };
+}
+
+/**
+ * Snaps all segments of a path that are near 0°, 90°, 180°, 270° (within tolerance) to exact right angles to the page.
+ */
+export function snapPathNodesToRightAngles(element: PathElement, angleToleranceDeg = 15): PathElement {
+  if (element.nodes.length < 2) return element;
+  const newNodes = element.nodes.map(n => ({
+    ...n,
+    anchor: { ...n.anchor },
+    handleIn: n.handleIn ? { ...n.handleIn } : undefined,
+    handleOut: n.handleOut ? { ...n.handleOut } : undefined,
+  }));
+  const tolRad = (angleToleranceDeg * Math.PI) / 180;
+
+  for (let i = 0; i < newNodes.length - 1; i++) {
+    const p1 = newNodes[i].anchor;
+    const p2 = newNodes[i + 1].anchor;
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-4) continue;
+
+    const angle = Math.atan2(Math.abs(dy), Math.abs(dx));
+
+    // Near horizontal (angle close to 0)
+    if (angle < tolRad) {
+      p2.y = p1.y;
+      if (newNodes[i].handleOut) newNodes[i].handleOut!.y = p1.y;
+      if (newNodes[i + 1].handleIn) newNodes[i + 1].handleIn!.y = p1.y;
+    }
+    // Near vertical (angle close to PI / 2 = 90 deg)
+    else if (Math.abs(angle - Math.PI / 2) < tolRad) {
+      p2.x = p1.x;
+      if (newNodes[i].handleOut) newNodes[i].handleOut!.x = p1.x;
+      if (newNodes[i + 1].handleIn) newNodes[i + 1].handleIn!.x = p1.x;
+    }
+  }
+
+  // Handle closed path loop segment back to origin
+  if (element.closed && newNodes.length > 2) {
+    const pLast = newNodes[newNodes.length - 1].anchor;
+    const pFirst = newNodes[0].anchor;
+    const dx = pFirst.x - pLast.x;
+    const dy = pFirst.y - pLast.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist >= 1e-4) {
+      const angle = Math.atan2(Math.abs(dy), Math.abs(dx));
+      if (angle < tolRad) {
+        pLast.y = pFirst.y;
+      } else if (Math.abs(angle - Math.PI / 2) < tolRad) {
+        pLast.x = pFirst.x;
+      }
+    }
+  }
+
+  return { ...element, nodes: newNodes };
+}
+
+/**
+ * Illustrator Direct-Select Node & Section Deletion:
+ * Removes specified nodes and deletes the connected sections.
+ * If the element is a closed loop, removing node(s) opens the loop at those nodes.
+ * If the element is an open path, removing internal node(s) splits the path into surviving open segments.
+ * Segments with fewer than 2 nodes are discarded.
+ */
+export function deleteNodesAndBreakSections(
+  element: PathElement,
+  nodeIdsToDelete: Set<string> | string[]
+): PathElement[] {
+  const { nodes, closed } = element;
+  if (!nodes || nodes.length === 0) return [];
+
+  const toDelete = nodeIdsToDelete instanceof Set ? nodeIdsToDelete : new Set(nodeIdsToDelete);
+  if (toDelete.size === 0) return [element];
+  if (nodes.every(n => toDelete.has(n.id))) return [];
+
+  // Group nodes into subpaths if any compound paths exist
+  const subpaths: VectorNode[][] = [];
+  let currentSub: VectorNode[] = [];
+  nodes.forEach((n, idx) => {
+    if (idx > 0 && n.subpathStart) {
+      if (currentSub.length > 0) subpaths.push(currentSub);
+      currentSub = [n];
+    } else {
+      currentSub.push(n);
+    }
+  });
+  if (currentSub.length > 0) subpaths.push(currentSub);
+
+  const survivingElements: PathElement[] = [];
+
+  subpaths.forEach(sub => {
+    const hasDeleted = sub.some(n => toDelete.has(n.id));
+    if (!hasDeleted) {
+      survivingElements.push({
+        ...element,
+        nodes: sub,
+        closed: element.closed,
+      });
+      return;
+    }
+
+    const survivingRuns: VectorNode[][] = [];
+
+    if (closed) {
+      // Find the first deleted node index in the cyclic subpath
+      const dIdx = sub.findIndex(n => toDelete.has(n.id));
+      let currentRun: VectorNode[] = [];
+      const len = sub.length;
+      for (let i = 1; i <= len; i++) {
+        const node = sub[(dIdx + i) % len];
+        if (toDelete.has(node.id)) {
+          if (currentRun.length > 0) {
+            survivingRuns.push(currentRun);
+            currentRun = [];
+          }
+        } else {
+          currentRun.push(node);
+        }
+      }
+      if (currentRun.length > 0) {
+        survivingRuns.push(currentRun);
+      }
+    } else {
+      // Open path: linear partition
+      let currentRun: VectorNode[] = [];
+      for (const node of sub) {
+        if (toDelete.has(node.id)) {
+          if (currentRun.length > 0) {
+            survivingRuns.push(currentRun);
+            currentRun = [];
+          }
+        } else {
+          currentRun.push(node);
+        }
+      }
+      if (currentRun.length > 0) {
+        survivingRuns.push(currentRun);
+      }
+    }
+
+    survivingRuns.forEach(run => {
+      if (run.length >= 2) {
+        const cloned: VectorNode[] = run.map((n, idx) => ({
+          ...n,
+          anchor: { ...n.anchor },
+          handleIn: idx === 0 ? undefined : (n.handleIn ? { ...n.handleIn } : undefined),
+          handleOut: idx === run.length - 1 ? undefined : (n.handleOut ? { ...n.handleOut } : undefined),
+          subpathStart: false,
+        }));
+
+        survivingElements.push({
+          ...element,
+          id: survivingElements.length === 0 ? element.id : `path-${Math.random().toString(36).substr(2, 9)}`,
+          name: survivingElements.length === 0 ? element.name : `${element.name} (Section ${survivingElements.length + 1})`,
+          type: 'path',
+          nodes: cloned,
+          closed: false,
+        });
+      }
+    });
+  });
+
+  return survivingElements;
+}
+
+/**
+ * Illustrator Direct-Select: Delete a specific segment (edge) between two nodes.
+ * If closed, opens the path by removing the edge between fromIdx and toIdx.
+ * If open, splits the path into two separate open paths.
+ */
+export function deleteSegmentFromElement(
+  element: PathElement,
+  fromIdx: number,
+  toIdx: number
+): PathElement[] {
+  const { nodes, closed } = element;
+  if (!nodes || nodes.length < 2) return [];
+
+  if (closed) {
+    const len = nodes.length;
+    const reordered: VectorNode[] = [];
+    for (let i = 0; i < len; i++) {
+      const idx = (toIdx + i) % len;
+      reordered.push(nodes[idx]);
+    }
+    const cloned: VectorNode[] = reordered.map((n, idx) => ({
+      ...n,
+      anchor: { ...n.anchor },
+      handleIn: idx === 0 ? undefined : (n.handleIn ? { ...n.handleIn } : undefined),
+      handleOut: idx === reordered.length - 1 ? undefined : (n.handleOut ? { ...n.handleOut } : undefined),
+      subpathStart: false,
+    }));
+    return [{
+      ...element,
+      type: 'path',
+      nodes: cloned,
+      closed: false,
+    }];
+  } else {
+    const piece1 = nodes.slice(0, fromIdx + 1).map((n, idx, arr) => ({
+      ...n,
+      anchor: { ...n.anchor },
+      handleIn: n.handleIn ? { ...n.handleIn } : undefined,
+      handleOut: idx === arr.length - 1 ? undefined : (n.handleOut ? { ...n.handleOut } : undefined),
+    }));
+    const piece2 = nodes.slice(toIdx).map((n, idx) => ({
+      ...n,
+      anchor: { ...n.anchor },
+      handleIn: idx === 0 ? undefined : (n.handleIn ? { ...n.handleIn } : undefined),
+      handleOut: n.handleOut ? { ...n.handleOut } : undefined,
+    }));
+    const res: PathElement[] = [];
+    if (piece1.length >= 2) {
+      res.push({ ...element, id: element.id, type: 'path', nodes: piece1, closed: false });
+    }
+    if (piece2.length >= 2) {
+      res.push({
+        ...element,
+        id: `path-${Math.random().toString(36).substr(2, 9)}`,
+        name: `${element.name} (Section 2)`,
+        type: 'path',
+        nodes: piece2,
+        closed: false,
+      });
+    }
+    return res;
+  }
 }

@@ -1,5 +1,6 @@
-import opentype from 'opentype.js';
-import { PathElement, VectorNode } from '../types';
+import * as opentype from 'opentype.js';
+import clipper from 'polygon-clipping';
+import { PathElement, VectorNode, Point } from '../types';
 
 export interface FontItem {
   id: string;
@@ -8,7 +9,7 @@ export interface FontItem {
   postscriptName?: string;
   category: 'local-api' | 'file-upload' | 'google-font' | 'system';
   style?: string;
-  blob?: Blob;
+  blob?: any;
   ttfUrl?: string;
   isLoaded?: boolean;
 }
@@ -16,125 +17,143 @@ export interface FontItem {
 // Global in-memory cache of parsed opentype font objects
 const opentypeCache = new Map<string, opentype.Font>();
 
-// Curated initial fonts available immediately
+// Curated fonts with direct mathematical TTF vectors available immediately
 export const INITIAL_FONTS: FontItem[] = [
-  // Popular Google Fonts (loaded via link tag in index.html)
+  // Curated Popular Fonts (High-precision TrueType vectors from Fontsource)
+  {
+    id: 'gf-inter',
+    family: 'Inter',
+    fullName: 'Inter Regular',
+    category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-400-normal.ttf'
+  },
   {
     id: 'gf-roboto',
     family: 'Roboto',
     fullName: 'Roboto Regular',
     category: 'google-font',
-    ttfUrl: 'https://fonts.gstatic.com/s/roboto/v30/KFOmCnqEu92Fr1Mu4mxK.woff2'
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/roboto@latest/latin-400-normal.ttf'
   },
   {
     id: 'gf-montserrat',
     family: 'Montserrat',
-    fullName: 'Montserrat Bold',
+    fullName: 'Montserrat Regular',
     category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/montserrat@latest/latin-400-normal.ttf'
   },
   {
     id: 'gf-bebas',
     family: 'Bebas Neue',
     fullName: 'Bebas Neue',
     category: 'google-font',
-  },
-  {
-    id: 'gf-inter',
-    family: 'Inter',
-    fullName: 'Inter SemiBold',
-    category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/bebas-neue@latest/latin-400-normal.ttf'
   },
   {
     id: 'gf-pacifico',
     family: 'Pacifico',
     fullName: 'Pacifico Cursive',
     category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/pacifico@latest/latin-400-normal.ttf'
   },
   {
     id: 'gf-playfair',
     family: 'Playfair Display',
     fullName: 'Playfair Display Serif',
     category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/playfair-display@latest/latin-400-normal.ttf'
   },
   {
     id: 'gf-oswald',
     family: 'Oswald',
     fullName: 'Oswald Sans',
     category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/oswald@latest/latin-400-normal.ttf'
   },
   {
     id: 'gf-caveat',
     family: 'Caveat',
     fullName: 'Caveat Handwriting',
     category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/caveat@latest/latin-400-normal.ttf'
   },
   {
     id: 'gf-firacode',
     family: 'Fira Code',
     fullName: 'Fira Code Monospace',
     category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/fira-code@latest/latin-400-normal.ttf'
   },
   {
     id: 'gf-lobster',
     family: 'Lobster',
     fullName: 'Lobster Script',
     category: 'google-font',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/lobster@latest/latin-400-normal.ttf'
   },
 
-  // Standard Computer & System Fonts (pre-installed on Windows / macOS / Linux)
+  // Standard Computer & System Fonts
   {
     id: 'sys-arial',
     family: 'Arial',
     fullName: 'Arial Sans',
     category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/arimo@latest/latin-400-normal.ttf'
   },
   {
     id: 'sys-helvetica',
     family: 'Helvetica',
     fullName: 'Helvetica Sans',
     category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-400-normal.ttf'
   },
   {
     id: 'sys-times',
     family: 'Times New Roman',
     fullName: 'Times New Roman Serif',
     category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/tinos@latest/latin-400-normal.ttf'
   },
   {
     id: 'sys-georgia',
     family: 'Georgia',
     fullName: 'Georgia Serif',
     category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/gelasio@latest/latin-400-normal.ttf'
   },
   {
     id: 'sys-impact',
     family: 'Impact',
     fullName: 'Impact Headline',
     category: 'system',
-  },
-  {
-    id: 'sys-trebuchet',
-    family: 'Trebuchet MS',
-    fullName: 'Trebuchet MS',
-    category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/anton@latest/latin-400-normal.ttf'
   },
   {
     id: 'sys-courier',
     family: 'Courier New',
     fullName: 'Courier New Mono',
     category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/cousine@latest/latin-400-normal.ttf'
   },
   {
     id: 'sys-verdana',
     family: 'Verdana',
     fullName: 'Verdana Sans',
     category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-400-normal.ttf'
+  },
+  {
+    id: 'sys-trebuchet',
+    family: 'Trebuchet MS',
+    fullName: 'Trebuchet MS',
+    category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/roboto@latest/latin-400-normal.ttf'
   },
   {
     id: 'sys-comic',
     family: 'Comic Sans MS',
     fullName: 'Comic Sans MS',
     category: 'system',
+    ttfUrl: 'https://cdn.jsdelivr.net/fontsource/fonts/caveat@latest/latin-400-normal.ttf'
   }
 ];
 
@@ -171,7 +190,7 @@ export async function queryLocalComputerFonts(): Promise<FontItem[]> {
         postscriptName: f.postscriptName,
         style: f.style || 'Regular',
         category: 'local-api',
-        blob: f.blob ? f : undefined, // font data handle for opentype extraction
+        blob: f, // FontData object handle with .blob() method
       });
     }
 
@@ -206,7 +225,7 @@ export async function loadFontFromFile(file: File): Promise<FontItem> {
     parsedFont.names.fullName?.en ||
     file.name.replace(/\.[^/.]+$/, '');
 
-  // Register font in the browser's document.fonts so it renders live on canvas
+  // Register font in browser's document.fonts so it renders live on canvas
   try {
     const fontFace = new FontFace(detectedFamily, buffer);
     const loadedFace = await fontFace.load();
@@ -216,7 +235,7 @@ export async function loadFontFromFile(file: File): Promise<FontItem> {
   }
 
   // Cache parsed opentype font for vector outlining
-  opentypeCache.set(detectedFamily, parsedFont);
+  opentypeCache.set(detectedFamily.toLowerCase(), parsedFont);
 
   const fontItem: FontItem = {
     id: `upload-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
@@ -232,34 +251,66 @@ export async function loadFontFromFile(file: File): Promise<FontItem> {
 }
 
 /**
+ * Returns Fontsource slug for standard families
+ */
+function getFontsourceSlug(family: string): string {
+  const norm = family.toLowerCase().trim();
+  const map: Record<string, string> = {
+    'inter': 'inter',
+    'roboto': 'roboto',
+    'montserrat': 'montserrat',
+    'bebas neue': 'bebas-neue',
+    'pacifico': 'pacifico',
+    'playfair display': 'playfair-display',
+    'oswald': 'oswald',
+    'caveat': 'caveat',
+    'fira code': 'fira-code',
+    'lobster': 'lobster',
+    'arial': 'arimo',
+    'helvetica': 'inter',
+    'times new roman': 'tinos',
+    'times': 'tinos',
+    'georgia': 'gelasio',
+    'impact': 'anton',
+    'trebuchet ms': 'roboto',
+    'verdana': 'inter',
+    'courier new': 'cousine',
+    'courier': 'cousine',
+    'comic sans ms': 'caveat',
+  };
+  return map[norm] || norm.replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+}
+
+/**
  * Retrieve or dynamically load an opentype.Font instance for a given font family
  */
 export async function getOrLoadOpentypeFont(fontItem: FontItem): Promise<opentype.Font | null> {
-  if (opentypeCache.has(fontItem.family)) {
-    return opentypeCache.get(fontItem.family)!;
+  const cacheKey = fontItem.family.toLowerCase();
+  if (opentypeCache.has(cacheKey)) {
+    return opentypeCache.get(cacheKey)!;
   }
 
-  // 1. If it came from Local Font Access API, extract blob
+  // 1. If it came from Local Font Access API, extract arrayBuffer from FontData
   if (fontItem.blob) {
     try {
-      const blobObj = typeof (fontItem.blob as any).blob === 'function' ? await (fontItem.blob as any).blob() : fontItem.blob;
+      const blobObj = typeof fontItem.blob.blob === 'function' ? await fontItem.blob.blob() : fontItem.blob;
       const buffer = await blobObj.arrayBuffer();
       const parsed = opentype.parse(buffer);
-      opentypeCache.set(fontItem.family, parsed);
+      opentypeCache.set(cacheKey, parsed);
       return parsed;
     } catch (e) {
       console.warn(`Could not extract blob for local font ${fontItem.family}:`, e);
     }
   }
 
-  // 2. If it has a direct TTF URL (e.g. Google Font or fallback)
+  // 2. If it has an explicit direct TTF URL
   if (fontItem.ttfUrl) {
     try {
       const resp = await fetch(fontItem.ttfUrl);
       if (resp.ok) {
         const buffer = await resp.arrayBuffer();
         const parsed = opentype.parse(buffer);
-        opentypeCache.set(fontItem.family, parsed);
+        opentypeCache.set(cacheKey, parsed);
         return parsed;
       }
     } catch (e) {
@@ -267,25 +318,24 @@ export async function getOrLoadOpentypeFont(fontItem: FontItem): Promise<opentyp
     }
   }
 
-  // 3. Try fetching from Google Fonts or jsDelivr GitHub fonts repository
-  const familyClean = encodeURIComponent(fontItem.family);
-  const possibleUrls = [
-    `https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/${fontItem.family.toLowerCase().replace(/\s+/g, '')}/${fontItem.family.replace(/\s+/g, '')}-Regular.ttf`,
-    `https://cdn.jsdelivr.net/gh/google/fonts@main/apache/${fontItem.family.toLowerCase().replace(/\s+/g, '')}/${fontItem.family.replace(/\s+/g, '')}-Regular.ttf`,
-    `https://fonts.cdnfonts.com/s/14881/Roboto-Regular.woff`,
+  // 3. Fallback to Fontsource CDN URL
+  const slug = getFontsourceSlug(fontItem.family);
+  const fontsourceUrls = [
+    `https://cdn.jsdelivr.net/fontsource/fonts/${slug}@latest/latin-400-normal.ttf`,
+    `https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-400-normal.ttf`
   ];
 
-  for (const url of possibleUrls) {
+  for (const url of fontsourceUrls) {
     try {
       const resp = await fetch(url);
       if (resp.ok) {
         const buffer = await resp.arrayBuffer();
         const parsed = opentype.parse(buffer);
-        opentypeCache.set(fontItem.family, parsed);
+        opentypeCache.set(cacheKey, parsed);
         return parsed;
       }
     } catch (e) {
-      // Continue to next
+      // Continue to next URL
     }
   }
 
@@ -293,56 +343,49 @@ export async function getOrLoadOpentypeFont(fontItem: FontItem): Promise<opentyp
 }
 
 /**
- * Converts opentype path commands into closed PathElement vector shapes with full Bézier handles.
+ * Converts mathematical OpenType path commands into clean VectorNode[]
+ * preserving Bézier tangents, smooth curves, and subpaths for holes (e.g. O, B, e).
  */
-export function opentypeCommandsToPathElements(
-  commands: any[],
-  baseElement: PathElement,
-  offsetX = 0,
-  offsetY = 0
-): PathElement[] {
-  const result: PathElement[] = [];
-  let currentNodes: VectorNode[] = [];
-  let contourIndex = 0;
+export function opentypeCommandsToNodes(commands: any[]): VectorNode[] {
+  const nodes: VectorNode[] = [];
+  let subpathStartIndex = 0;
 
   for (let i = 0; i < commands.length; i++) {
     const cmd = commands[i];
 
     if (cmd.type === 'M') {
-      if (currentNodes.length > 0) {
-        result.push(createSubpathElement(baseElement, currentNodes, false, contourIndex++));
-        currentNodes = [];
-      }
-      currentNodes.push({
+      subpathStartIndex = nodes.length;
+      nodes.push({
         id: `node-txt-${Math.random().toString(36).substr(2, 7)}`,
-        anchor: { x: cmd.x + offsetX, y: cmd.y + offsetY },
+        anchor: { x: cmd.x, y: cmd.y },
         type: 'corner',
+        subpathStart: true,
       });
     } else if (cmd.type === 'L') {
-      currentNodes.push({
+      nodes.push({
         id: `node-txt-${Math.random().toString(36).substr(2, 7)}`,
-        anchor: { x: cmd.x + offsetX, y: cmd.y + offsetY },
+        anchor: { x: cmd.x, y: cmd.y },
         type: 'corner',
       });
     } else if (cmd.type === 'C') {
-      if (currentNodes.length > 0) {
-        const prev = currentNodes[currentNodes.length - 1];
-        prev.handleOut = { x: cmd.x1 + offsetX, y: cmd.y1 + offsetY };
+      if (nodes.length > 0) {
+        const prev = nodes[nodes.length - 1];
+        prev.handleOut = { x: cmd.x1, y: cmd.y1 };
         prev.type = 'smooth';
       }
-      currentNodes.push({
+      nodes.push({
         id: `node-txt-${Math.random().toString(36).substr(2, 7)}`,
-        anchor: { x: cmd.x + offsetX, y: cmd.y + offsetY },
-        handleIn: { x: cmd.x2 + offsetX, y: cmd.y2 + offsetY },
+        anchor: { x: cmd.x, y: cmd.y },
+        handleIn: { x: cmd.x2, y: cmd.y2 },
         type: 'smooth',
       });
     } else if (cmd.type === 'Q') {
-      // Convert quadratic Bézier to cubic Bézier
-      if (currentNodes.length > 0) {
-        const prev = currentNodes[currentNodes.length - 1];
+      // Convert quadratic Bézier to cubic Bézier for exact curve matching
+      if (nodes.length > 0) {
+        const prev = nodes[nodes.length - 1];
         const p0 = prev.anchor;
-        const p1 = { x: cmd.x1 + offsetX, y: cmd.y1 + offsetY };
-        const p2 = { x: cmd.x + offsetX, y: cmd.y + offsetY };
+        const p1 = { x: cmd.x1, y: cmd.y1 };
+        const p2 = { x: cmd.x, y: cmd.y };
 
         const cp1 = {
           x: p0.x + (2 / 3) * (p1.x - p0.x),
@@ -356,7 +399,7 @@ export function opentypeCommandsToPathElements(
         prev.handleOut = cp1;
         prev.type = 'smooth';
 
-        currentNodes.push({
+        nodes.push({
           id: `node-txt-${Math.random().toString(36).substr(2, 7)}`,
           anchor: p2,
           handleIn: cp2,
@@ -364,195 +407,265 @@ export function opentypeCommandsToPathElements(
         });
       }
     } else if (cmd.type === 'Z') {
-      if (currentNodes.length > 1) {
-        // Check if last node matches first node
-        const first = currentNodes[0];
-        const last = currentNodes[currentNodes.length - 1];
+      // Close subpath: if last node coincides with subpath start, merge tangent and pop duplicate
+      if (nodes.length > subpathStartIndex + 1) {
+        const first = nodes[subpathStartIndex];
+        const last = nodes[nodes.length - 1];
         const dist = Math.hypot(first.anchor.x - last.anchor.x, first.anchor.y - last.anchor.y);
         if (dist < 0.5) {
           if (last.handleIn && !first.handleIn) {
             first.handleIn = last.handleIn;
+            first.type = 'smooth';
           }
-          currentNodes.pop();
+          nodes.pop();
         }
-        result.push(createSubpathElement(baseElement, currentNodes, true, contourIndex++));
-        currentNodes = [];
       }
     }
   }
 
-  if (currentNodes.length > 0) {
-    result.push(createSubpathElement(baseElement, currentNodes, false, contourIndex++));
-  }
-
-  return result;
-}
-
-function createSubpathElement(
-  base: PathElement,
-  nodes: VectorNode[],
-  closed: boolean,
-  index: number
-): PathElement {
-  return {
-    id: `path-outline-${Math.random().toString(36).substr(2, 8)}-${index}`,
-    name: `${base.text || 'Text'} Outline ${index + 1}`,
-    type: 'path',
-    nodes,
-    closed,
-    fill: base.fill === 'none' ? 'none' : base.fill,
-    fillOpacity: base.fillOpacity ?? 1,
-    stroke: base.stroke || '#111827',
-    strokeWidth: base.strokeWidth || 1,
-    visible: true,
-    locked: false,
-    brushId: base.brushId,
-  };
+  return nodes;
 }
 
 /**
- * Fallback contour vectorizer using high-resolution offscreen HTML Canvas
- * when direct opentype font binary is not available.
+ * Ramer-Douglas-Peucker polygon reduction algorithm for clean anchor points
  */
-export function rasterContourVectorizer(
-  text: string,
-  baseElement: PathElement,
-  x: number,
-  y: number,
-  fontSize: number,
-  fontFamily: string,
-  fontWeight: string | number = 400,
-  fontStyle = 'normal'
-): PathElement[] {
-  const canvas = document.createElement('canvas');
-  const scale = 2; // high resolution rasterization for smooth vector curves
-  const fontStr = `${fontStyle} ${fontWeight} ${fontSize * scale}px "${fontFamily}", sans-serif`;
+function simplifyPoints(points: Point[], epsilon = 0.4): Point[] {
+  if (points.length <= 2) return points;
+  let maxDist = 0;
+  let index = 0;
+  const p1 = points[0];
+  const p2 = points[points.length - 1];
+  const lineDx = p2.x - p1.x;
+  const lineDy = p2.y - p1.y;
+  const lineLenSq = lineDx * lineDx + lineDy * lineDy;
 
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return [];
-
-  ctx.font = fontStr;
-  const metrics = ctx.measureText(text);
-  const textW = Math.ceil(metrics.width) + 20 * scale;
-  const ascent = Math.ceil(metrics.actualBoundingBoxAscent || fontSize * 0.8 * scale);
-  const descent = Math.ceil(metrics.actualBoundingBoxDescent || fontSize * 0.2 * scale);
-  const textH = ascent + descent + 20 * scale;
-
-  canvas.width = Math.max(textW, 20);
-  canvas.height = Math.max(textH, 20);
-
-  // Render text cleanly in black on transparent
-  ctx.font = fontStr;
-  ctx.fillStyle = '#000000';
-  ctx.textBaseline = 'alphabetic';
-  const drawX = 10 * scale;
-  const drawY = 10 * scale + ascent;
-  ctx.fillText(text, drawX, drawY);
-
-  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const data = imgData.data;
-  const w = canvas.width;
-  const h = canvas.height;
-
-  // Marching Squares / Boundary tracer to extract outer & inner boundary loops
-  const visited = new Uint8Array(w * h);
-  const isOpaque = (px: number, py: number) => {
-    if (px < 0 || px >= w || py < 0 || py >= h) return false;
-    return data[(py * w + px) * 4 + 3] > 120; // alpha threshold
-  };
-
-  const contours: { x: number; y: number }[][] = [];
-
-  for (let cy = 1; cy < h - 1; cy += 2) {
-    for (let cx = 1; cx < w - 1; cx += 2) {
-      if (isOpaque(cx, cy) && !visited[cy * w + cx]) {
-        // Trace contour boundary
-        const pts: { x: number; y: number }[] = [];
-        let currX = cx;
-        let currY = cy;
-        let dir = 0; // 0: right, 1: down, 2: left, 3: up
-        const dx = [1, 0, -1, 0];
-        const dy = [0, 1, 0, -1];
-        let steps = 0;
-        const maxSteps = 4000;
-
-        while (steps < maxSteps) {
-          visited[currY * w + currX] = 1;
-          pts.push({
-            x: x + (currX - drawX) / scale,
-            y: y + (currY - drawY) / scale,
-          });
-
-          // Check next step
-          let found = false;
-          for (let turn = -1; turn <= 2; turn++) {
-            const nextDir = (dir + turn + 4) % 4;
-            const nx = currX + dx[nextDir];
-            const ny = currY + dy[nextDir];
-            if (isOpaque(nx, ny)) {
-              currX = nx;
-              currY = ny;
-              dir = nextDir;
-              found = true;
-              break;
-            }
-          }
-
-          if (!found || (currX === cx && currY === cy && steps > 3)) {
-            break;
-          }
-          steps++;
-        }
-
-        if (pts.length > 6) {
-          // Downsample points for clean vector nodes
-          const simplified: { x: number; y: number }[] = [];
-          const stepSize = Math.max(1, Math.floor(pts.length / 45));
-          for (let k = 0; k < pts.length; k += stepSize) {
-            simplified.push(pts[k]);
-          }
-          contours.push(simplified);
-        }
-      }
+  for (let i = 1; i < points.length - 1; i++) {
+    let d = 0;
+    if (lineLenSq === 0) {
+      d = Math.hypot(points[i].x - p1.x, points[i].y - p1.y);
+    } else {
+      const t = Math.max(0, Math.min(1, ((points[i].x - p1.x) * lineDx + (points[i].y - p1.y) * lineDy) / lineLenSq));
+      const projX = p1.x + t * lineDx;
+      const projY = p1.y + t * lineDy;
+      d = Math.hypot(points[i].x - projX, points[i].y - projY);
+    }
+    if (d > maxDist) {
+      maxDist = d;
+      index = i;
     }
   }
 
-  // Convert contours into PathElements with smooth vector nodes
-  return contours.map((contour, cIdx) => {
-    const nodes: VectorNode[] = contour.map((pt, pIdx) => {
-      const prev = contour[(pIdx - 1 + contour.length) % contour.length];
-      const next = contour[(pIdx + 1) % contour.length];
-      const tanX = (next.x - prev.x) * 0.25;
-      const tanY = (next.y - prev.y) * 0.25;
+  if (maxDist > epsilon) {
+    const left = simplifyPoints(points.slice(0, index + 1), epsilon);
+    const right = simplifyPoints(points.slice(index), epsilon);
+    return [...left.slice(0, -1), ...right];
+  } else {
+    return [p1, p2];
+  }
+}
 
-      return {
-        id: `node-vect-${Math.random().toString(36).substr(2, 7)}`,
-        anchor: { x: pt.x, y: pt.y },
-        handleIn: { x: pt.x - tanX, y: pt.y - tanY },
-        handleOut: { x: pt.x + tanX, y: pt.y + tanY },
+/**
+ * Converts a polygon ring into smooth VectorNode[] with cubic Bézier tangent handles
+ */
+function ringToVectorNodes(ringCoords: [number, number][], isSubpathStart = true): VectorNode[] {
+  // polygon-clipping rings have first and last point identical
+  const pts: Point[] = ringCoords.slice(0, -1).map(c => ({ x: c[0], y: c[1] }));
+  if (pts.length < 3) return [];
+  const simplified = simplifyPoints(pts, 0.4);
+  if (simplified.length < 3) return [];
+
+  const nodes: VectorNode[] = [];
+  const count = simplified.length;
+
+  for (let i = 0; i < count; i++) {
+    const curr = simplified[i];
+    const prev = simplified[(i - 1 + count) % count];
+    const next = simplified[(i + 1) % count];
+
+    const d1x = curr.x - prev.x;
+    const d1y = curr.y - prev.y;
+    const d2x = next.x - curr.x;
+    const d2y = next.y - curr.y;
+    const l1 = Math.hypot(d1x, d1y) || 1;
+    const l2 = Math.hypot(d2x, d2y) || 1;
+    const dot = (d1x * d2x + d1y * d2y) / (l1 * l2);
+
+    const isFirstNode = (i === 0);
+
+    if (dot < 0.6) {
+      // Corner node (sharp turn)
+      nodes.push({
+        id: `node-${Math.random().toString(36).substr(2, 7)}`,
+        anchor: curr,
+        type: 'corner',
+        subpathStart: (isFirstNode && isSubpathStart) ? true : undefined,
+      });
+    } else {
+      // Smooth node with tangential cubic Bézier control handles
+      const tanX = next.x - prev.x;
+      const tanY = next.y - prev.y;
+      const tanLen = Math.hypot(tanX, tanY) || 1;
+      const ux = tanX / tanLen;
+      const uy = tanY / tanLen;
+      const hLen1 = Math.min(l1 * 0.35, 20);
+      const hLen2 = Math.min(l2 * 0.35, 20);
+
+      nodes.push({
+        id: `node-${Math.random().toString(36).substr(2, 7)}`,
+        anchor: curr,
+        handleIn: { x: curr.x - ux * hLen1, y: curr.y - uy * hLen1 },
+        handleOut: { x: curr.x + ux * hLen2, y: curr.y + uy * hLen2 },
         type: 'smooth',
-      };
-    });
+        subpathStart: (isFirstNode && isSubpathStart) ? true : undefined,
+      });
+    }
+  }
 
-    return {
-      id: `path-vectorized-${Math.random().toString(36).substr(2, 8)}-${cIdx}`,
-      name: `${baseElement.text || 'Text'} Outline ${cIdx + 1}`,
-      type: 'path',
-      nodes,
-      closed: true,
-      fill: baseElement.fill === 'none' ? 'none' : baseElement.fill,
-      fillOpacity: baseElement.fillOpacity ?? 1,
-      stroke: baseElement.stroke || '#111827',
-      strokeWidth: baseElement.strokeWidth || 1,
-      visible: true,
-      locked: false,
-    };
+  return nodes;
+}
+
+/**
+ * Checks whether a 2D point is inside a closed polygon ring
+ */
+function pointInPolygon(pt: [number, number], ring: [number, number][]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    const intersect = ((yi > pt[1]) !== (yj > pt[1])) &&
+      (pt[0] < ((xj - xi) * (pt[1] - yi)) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * Computes signed polygon area (shoelace formula)
+ */
+function signedPolygonArea(ring: [number, number][]): number {
+  let area = 0;
+  for (let i = 0; i < ring.length - 1; i++) {
+    area += (ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1]);
+  }
+  return area / 2;
+}
+
+/**
+ * Discretizes OpenType path commands into closed polygon rings
+ */
+function opentypeCommandsToRings(commands: any[]): [number, number][][] {
+  const rings: [number, number][][] = [];
+  let currentRing: [number, number][] = [];
+  let prevPt: [number, number] = [0, 0];
+
+  for (const cmd of commands) {
+    if (cmd.type === 'M') {
+      if (currentRing.length > 2) {
+        currentRing.push([currentRing[0][0], currentRing[0][1]]);
+        rings.push(currentRing);
+      }
+      prevPt = [cmd.x, cmd.y];
+      currentRing = [prevPt];
+    } else if (cmd.type === 'L') {
+      prevPt = [cmd.x, cmd.y];
+      currentRing.push(prevPt);
+    } else if (cmd.type === 'Q') {
+      const p0 = prevPt;
+      const p1: [number, number] = [cmd.x1, cmd.y1];
+      const p2: [number, number] = [cmd.x, cmd.y];
+      const len = Math.hypot(p2[0] - p0[0], p2[1] - p0[1]);
+      const steps = Math.max(5, Math.min(24, Math.ceil(len / 2.5)));
+      for (let s = 1; s <= steps; s++) {
+        const t = s / steps;
+        const mt = 1 - t;
+        const x = mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0];
+        const y = mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1];
+        currentRing.push([x, y]);
+      }
+      prevPt = p2;
+    } else if (cmd.type === 'C') {
+      const p0 = prevPt;
+      const p1: [number, number] = [cmd.x1, cmd.y1];
+      const p2: [number, number] = [cmd.x2, cmd.y2];
+      const p3: [number, number] = [cmd.x, cmd.y];
+      const len = Math.hypot(p3[0] - p0[0], p3[1] - p0[1]);
+      const steps = Math.max(6, Math.min(32, Math.ceil(len / 2.5)));
+      for (let s = 1; s <= steps; s++) {
+        const t = s / steps;
+        const mt = 1 - t;
+        const mt2 = mt * mt;
+        const t2 = t * t;
+        const x = mt2 * mt * p0[0] + 3 * mt2 * t * p1[0] + 3 * mt * t2 * p2[0] + t2 * t * p3[0];
+        const y = mt2 * mt * p0[1] + 3 * mt2 * t * p1[1] + 3 * mt * t2 * p2[1] + t2 * t * p3[1];
+        currentRing.push([x, y]);
+      }
+      prevPt = p3;
+    } else if (cmd.type === 'Z') {
+      if (currentRing.length > 2) {
+        currentRing.push([currentRing[0][0], currentRing[0][1]]);
+        rings.push(currentRing);
+        currentRing = [];
+      }
+    }
+  }
+  if (currentRing.length > 2) {
+    currentRing.push([currentRing[0][0], currentRing[0][1]]);
+    rings.push(currentRing);
+  }
+  return rings;
+}
+
+/**
+ * Organizes rings into [outerRing, ...holeRings] polygons via topological containment
+ */
+function ringsToPolygons(rings: [number, number][][]): [number, number][][][] {
+  const valid = rings
+    .map(r => ({ ring: r, area: Math.abs(signedPolygonArea(r)) }))
+    .filter(r => r.area > 0.5)
+    .sort((a, b) => b.area - a.area);
+
+  if (valid.length === 0) return [];
+
+  const ringMetas = valid.map((item, idx) => {
+    let parentIdx = -1;
+    let depth = 0;
+    const sampleIndices = [0.25, 0.5, 0.75].map(f => Math.floor(item.ring.length * f));
+    for (let j = 0; j < idx; j++) {
+      let insideCount = 0;
+      for (const sIdx of sampleIndices) {
+        if (pointInPolygon(item.ring[sIdx], valid[j].ring)) {
+          insideCount++;
+        }
+      }
+      if (insideCount >= 2) {
+        depth++;
+        if (parentIdx === -1) parentIdx = j;
+      }
+    }
+    return { ring: item.ring, depth, parentIdx, idx, area: item.area };
+  });
+
+  const outers = ringMetas.filter(m => m.depth % 2 === 0);
+  const holes = ringMetas.filter(m => m.depth % 2 === 1);
+
+  return outers.map(outer => {
+    const myHoles = holes
+      .filter(h => h.parentIdx === outer.idx)
+      .map(h => h.ring);
+    return [outer.ring, ...myHoles];
   });
 }
 
 /**
- * High-level function to convert a Text Element into vector outlines (Illustrator "Create Outlines" / Ctrl+Shift+O).
- * Tries opentype first for 100% mathematical Bézier precision; falls back to canvas vectorizer.
+ * High-level function to convert a Text Element into true solid vector shapes
+ * (Illustrator "Create Outlines" / "Expand into Shapes" with automatic Pathfinder Unite / Weld).
+ *
+ * When fonts are made of overlapping paths (such as cursive connectors, script fonts, ligatures,
+ * or overlapping strokes), this function performs a clean Boolean Union so that:
+ * 1. Each word becomes a solid continuous shape.
+ * 2. The path goes ONLY around the exterior outline and internal counter holes (e.g. 'e', 'o', 'a').
+ * 3. NO internal paths go through the middle of the shape.
+ * 4. NO inverted sections are created when rendered with fill or stroke.
  */
 export async function convertTextToOutlines(
   textElement: PathElement,
@@ -561,11 +674,12 @@ export async function convertTextToOutlines(
   const text = textElement.text || 'Text';
   const fontSize = textElement.fontSize || 48;
   const fontFamily = textElement.fontFamily || 'Inter';
+  const letterSpacing = textElement.letterSpacing || 0;
 
   // Calculate baseline offset from bounding box
   const minX = textElement.nodes.length > 0 ? Math.min(...textElement.nodes.map(n => n.anchor.x)) : 100;
   const minY = textElement.nodes.length > 0 ? Math.min(...textElement.nodes.map(n => n.anchor.y)) : 100;
-  const baselineY = minY + fontSize * 0.85;
+  const baselineY = minY + fontSize * 0.82;
 
   // Find font item
   const fontItem = fontsList.find(f => f.family.toLowerCase() === fontFamily.toLowerCase()) || {
@@ -574,39 +688,115 @@ export async function convertTextToOutlines(
     category: 'system' as const,
   };
 
-  try {
-    const opentypeFont = await getOrLoadOpentypeFont(fontItem);
-    if (opentypeFont) {
-      const path = opentypeFont.getPath(text, minX, baselineY, fontSize, {
-        kerning: true,
-        letterSpacing: textElement.letterSpacing ? textElement.letterSpacing / fontSize : 0,
-      });
+  const opentypeFont = await getOrLoadOpentypeFont(fontItem);
+  if (!opentypeFont) {
+    throw new Error(`Unable to load vector font outlines for ${fontFamily}`);
+  }
 
-      if (path && path.commands && path.commands.length > 0) {
-        const shapes = opentypeCommandsToPathElements(path.commands, textElement);
-        if (shapes.length > 0) {
-          return shapes;
+  const scale = fontSize / opentypeFont.unitsPerEm;
+  const words = text.split(/(\s+)/);
+  let currentX = minX;
+  const wordShapes: PathElement[] = [];
+
+  for (let wIdx = 0; wIdx < words.length; wIdx++) {
+    const part = words[wIdx];
+    if (!part) continue;
+
+    // Handle whitespace spacing
+    if (/^\s+$/.test(part)) {
+      currentX += part.length * (fontSize * 0.28 + letterSpacing);
+      continue;
+    }
+
+    // Collect all glyph commands for this word
+    const wordCommands: any[] = [];
+    let wordCursorX = currentX;
+
+    for (let cIdx = 0; cIdx < part.length; cIdx++) {
+      const char = part[cIdx];
+      const glyph = opentypeFont.charToGlyph(char);
+      const glyphPath = glyph.getPath(wordCursorX, baselineY, fontSize);
+
+      if (glyphPath && glyphPath.commands && glyphPath.commands.length > 0) {
+        wordCommands.push(...glyphPath.commands);
+      }
+
+      const advance = (glyph.advanceWidth || 1000) * scale;
+      wordCursorX += advance + letterSpacing;
+    }
+    currentX = wordCursorX;
+
+    if (wordCommands.length === 0) continue;
+
+    // Discretize commands into rings and group into polygons
+    const rings = opentypeCommandsToRings(wordCommands);
+    const polygons = ringsToPolygons(rings);
+
+    if (polygons.length === 0) {
+      // Fallback: direct opentype commands conversion
+      const rawNodes = opentypeCommandsToNodes(wordCommands);
+      if (rawNodes.length >= 3) {
+        wordShapes.push({
+          id: `shape-text-${Math.random().toString(36).substr(2, 8)}-${wIdx}`,
+          name: `${textElement.text || 'Text'}: ${part}`,
+          type: 'path',
+          nodes: rawNodes,
+          closed: true,
+          fill: textElement.fill === 'none' ? 'none' : textElement.fill,
+          fillOpacity: textElement.fillOpacity ?? 1,
+          stroke: textElement.strokeWidth === 0 || textElement.stroke === 'none' ? 'none' : textElement.stroke,
+          strokeWidth: textElement.strokeWidth || 0,
+          visible: true,
+          locked: false,
+        });
+      }
+      continue;
+    }
+
+    let unioned: any = null;
+    try {
+      if (polygons.length === 1) {
+        unioned = (clipper.union as any)(polygons[0]);
+      } else if (polygons.length > 1) {
+        unioned = (clipper.union as any)(polygons[0], ...polygons.slice(1));
+      }
+    } catch (e) {
+      console.warn("Clipper union failed, using raw polygons", e);
+    }
+
+    const finalPolys: any[] = (unioned && unioned.length > 0) ? unioned : polygons;
+
+    // Convert unioned polygons into VectorNode[]
+    const wordNodes: VectorNode[] = [];
+    for (const poly of finalPolys) {
+      for (const ring of poly) {
+        const ringNodes = ringToVectorNodes(ring, true);
+        if (ringNodes.length > 0) {
+          wordNodes.push(...ringNodes);
         }
       }
     }
-  } catch (err) {
-    console.warn('Opentype outline generation failed, falling back to raster vectorizer:', err);
+
+    if (wordNodes.length >= 3) {
+      wordShapes.push({
+        id: `shape-text-${Math.random().toString(36).substr(2, 8)}-${wIdx}`,
+        name: `${textElement.text || 'Text'}: ${part}`,
+        type: 'path',
+        nodes: wordNodes,
+        closed: true,
+        fill: textElement.fill === 'none' ? 'none' : textElement.fill,
+        fillOpacity: textElement.fillOpacity ?? 1,
+        stroke: textElement.strokeWidth === 0 || textElement.stroke === 'none' ? 'none' : textElement.stroke,
+        strokeWidth: textElement.strokeWidth || 0,
+        visible: true,
+        locked: false,
+      });
+    }
   }
 
-  // Fallback to Canvas contour vectorizer
-  const fallbackShapes = rasterContourVectorizer(
-    text,
-    textElement,
-    minX,
-    baselineY,
-    fontSize,
-    fontFamily,
-    textElement.fontWeight || 400,
-    textElement.fontStyle || 'normal'
-  );
-
-  return fallbackShapes;
+  return wordShapes;
 }
+
 
 /**
  * Measure accurate text bounding box on canvas
