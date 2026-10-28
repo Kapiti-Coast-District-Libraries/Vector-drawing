@@ -38,8 +38,14 @@ import {
   Slash,
   Type,
   Ruler,
-  Wand2
+  Wand2,
+  Cloud,
+  CloudUpload,
+  User as UserIcon
 } from 'lucide-react';
+import { auth, CloudDocument, saveDocumentToCloud } from './utils/firebase';
+import { generateThumbnailSvg } from './utils/thumbnail-generator';
+import { CloudDocumentsModal } from './components/CloudDocumentsModal';
 import {
   Point,
   VectorNode,
@@ -93,6 +99,7 @@ import {
 import { TextPropertiesPanel } from './components/TextPropertiesPanel';
 import { ComputerFontModal } from './components/ComputerFontModal';
 import { ImageTraceModal } from './components/ImageTraceModal';
+import { optimizeTracingImageDataUrl } from './utils/image-optimizer';
 import { CanvasRulers } from './components/CanvasRulers';
 import { TransformPanel } from './components/TransformPanel';
 import { ContextMenu } from './components/ContextMenu';
@@ -150,6 +157,12 @@ export default function App() {
   ]);
   const [activeLayerId, setActiveLayerId] = useState<string>('layer-1');
 
+  // --- Cloud Storage & Multi-computer State ---
+  const [isCloudModalOpen, setIsCloudModalOpen] = useState<boolean>(false);
+  const [cloudModalMode, setCloudModalMode] = useState<'browse' | 'save'>('browse');
+  const [activeCloudDoc, setActiveCloudDoc] = useState<CloudDocument | null>(null);
+  const [isCloudDocDirty, setIsCloudDocDirty] = useState<boolean>(false);
+
   // --- Undo/Redo Stacks & Refs ---
   const undoStack = useRef<Layer[][]>([]);
   const redoStack = useRef<Layer[][]>([]);
@@ -162,6 +175,7 @@ export default function App() {
     // Only push if different from last state
     if (!lastState || JSON.stringify(lastState) !== JSON.stringify(clone)) {
       undoStack.current.push(clone);
+      setIsCloudDocDirty(true);
       if (undoStack.current.length > 50) {
         undoStack.current.shift();
       }
@@ -1871,11 +1885,15 @@ export default function App() {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       if (typeof event.target?.result === 'string') {
+        const rawUrl = event.target.result;
+        // Optimize JPEG/PNG to maintain crisp tracing detail while ensuring it fits reliably in cloud storage
+        const optimizedUrl = await optimizeTracingImageDataUrl(rawUrl, 1400, 0.82);
+
         const img: TracingImage = {
           id: `trace-img-${Date.now()}`,
-          url: event.target.result,
+          url: optimizedUrl,
           name: file.name,
           x: 100,
           y: 70,
@@ -1886,7 +1904,8 @@ export default function App() {
           locked: false,
         };
         setTracingImage(img);
-        alert(`Kua utaina te pikitia: ${file.name} (Successfully loaded tracing reference)`);
+        setIsCloudDocDirty(true);
+        setExpandToast(`Loaded tracing reference: ${file.name}`);
       }
     };
     reader.readAsDataURL(file);
@@ -4038,7 +4057,10 @@ export default function App() {
 
       const isModKey = e.ctrlKey || e.metaKey;
 
-      if (isModKey && (e.key === 'c' || e.key === 'C')) {
+      if (isModKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        handleQuickSaveCloud();
+      } else if (isModKey && (e.key === 'c' || e.key === 'C')) {
         e.preventDefault();
         handleCopy();
       } else if (isModKey && (e.key === 'x' || e.key === 'X')) {
@@ -4397,6 +4419,94 @@ export default function App() {
     reader.readAsText(file);
   };
 
+  // --- CLOUD STORAGE HANDLERS ---
+  const handleLoadCloudDocument = (docToLoad: CloudDocument) => {
+    pushHistory(layers);
+    if (Array.isArray(docToLoad.layers) && docToLoad.layers.length > 0) {
+      setLayers(docToLoad.layers);
+      setActiveLayerId(docToLoad.layers[0].id);
+    }
+    // Restore attached tracing reference JPEG/PNG
+    if (docToLoad.tracingImage) {
+      setTracingImage(docToLoad.tracingImage);
+    } else {
+      setTracingImage(null);
+    }
+    if (docToLoad.artboardWidth) {
+      setArtboardWidth(docToLoad.artboardWidth);
+    }
+    if (docToLoad.artboardHeight) {
+      setArtboardHeight(docToLoad.artboardHeight);
+    }
+    if (docToLoad.unit) {
+      setUnit(docToLoad.unit as UnitType);
+    }
+    setActiveCloudDoc(docToLoad);
+    setIsCloudDocDirty(false);
+    setSelectedElementIds([]);
+    setSelectedNodeInfo(null);
+    setSelectedHandle(null);
+    setExpandToast(`Loaded "${docToLoad.title}" from cloud!`);
+  };
+
+  const [isSavingDirectly, setIsSavingDirectly] = useState<boolean>(false);
+
+  const handleSavedCloudDocument = (savedDoc: CloudDocument) => {
+    setActiveCloudDoc(savedDoc);
+    setIsCloudDocDirty(false);
+    setExpandToast(`Saved "${savedDoc.title}" to cloud!`);
+  };
+
+  const handleQuickSaveCloud = async () => {
+    // If no document is currently open, open the save modal to give it a name
+    if (!activeCloudDoc) {
+      handleOpenCloudModal('save');
+      return;
+    }
+
+    setIsSavingDirectly(true);
+    try {
+      const thumbnailSvg = generateThumbnailSvg(layers, artboardWidth, artboardHeight);
+      await saveDocumentToCloud({
+        id: activeCloudDoc.id,
+        title: activeCloudDoc.title,
+        studentName: activeCloudDoc.studentName,
+        lessonName: activeCloudDoc.lessonName,
+        layers,
+        tracingImage,
+        artboardWidth,
+        artboardHeight,
+        unit,
+        thumbnailSvg
+      });
+
+      const updatedDoc: CloudDocument = {
+        ...activeCloudDoc,
+        layers,
+        tracingImage,
+        artboardWidth,
+        artboardHeight,
+        unit,
+        thumbnailSvg,
+        updatedAt: new Date()
+      };
+
+      setActiveCloudDoc(updatedDoc);
+      setIsCloudDocDirty(false);
+      setExpandToast(`Saved changes to "${activeCloudDoc.title}"!`);
+    } catch (err: any) {
+      console.error(err);
+      setExpandToast(`Save error: ${err.message || 'Could not update document'}`);
+    } finally {
+      setIsSavingDirectly(false);
+    }
+  };
+
+  const handleOpenCloudModal = (mode: 'browse' | 'save' = 'browse') => {
+    setCloudModalMode(mode);
+    setIsCloudModalOpen(true);
+  };
+
   const selectedElements = getAllElements().filter(e => selectedElementIds.includes(e.id));
   const activeSelectedElement = selectedElements[0] || null;
 
@@ -4430,20 +4540,87 @@ export default function App() {
             <Sparkles size={22} />
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight text-slate-900 flex items-center gap-2">
-              Kāpiti Libraries Vector Design
-            </h1>
+            <div className="flex items-center gap-2.5">
+              <h1 className="text-xl font-bold tracking-tight text-slate-900 flex items-center gap-2">
+                Kāpiti Libraries Vector Design
+              </h1>
+              {activeCloudDoc ? (
+                <button
+                  onClick={() => handleOpenCloudModal('browse')}
+                  className="flex items-center gap-1.5 px-2.5 py-1 bg-blue-50 hover:bg-blue-100 border border-blue-200/90 rounded-full text-xs transition cursor-pointer"
+                  title="Click to manage cloud documents"
+                >
+                  <Cloud size={12} className="text-blue-600 shrink-0" />
+                  <span className="font-semibold text-blue-900 max-w-[130px] truncate">
+                    {activeCloudDoc.title}
+                  </span>
+                  {isCloudDocDirty ? (
+                    <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" title="Unsaved changes" />
+                  ) : (
+                    <span className="text-[10px] text-emerald-600 font-bold">Saved</span>
+                  )}
+                </button>
+              ) : (
+                <button
+                  onClick={() => handleOpenCloudModal('save')}
+                  className="flex items-center gap-1 px-2.5 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-full text-[11px] font-medium transition cursor-pointer"
+                  title="Save current work to cloud"
+                >
+                  <Cloud size={11} className="text-slate-400" />
+                  <span>Cloud: Not Saved</span>
+                </button>
+              )}
+            </div>
             <p className="text-xs text-slate-500">Illustrator-style Pen Tool, Bezier Node Editor & Tracing studio.</p>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
+          {/* Cloud Library & Multi-Computer Access */}
+          <button
+            onClick={() => handleOpenCloudModal('browse')}
+            className="flex items-center gap-1.5 px-3 py-2 bg-blue-50/70 hover:bg-blue-100 border border-blue-200 text-blue-800 rounded-lg font-semibold text-xs transition shadow-xs cursor-pointer"
+            title="Open saved vector documents from the cloud (access across any computer in your lessons)"
+          >
+            <Cloud size={14} className="text-blue-600" />
+            <span>Cloud Library</span>
+          </button>
+
+          {/* Save to Cloud Button */}
+          <button
+            onClick={handleQuickSaveCloud}
+            disabled={isSavingDirectly}
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white rounded-lg font-semibold text-xs transition shadow-sm shadow-blue-500/20 cursor-pointer disabled:opacity-60"
+            title={activeCloudDoc ? `Save changes directly over "${activeCloudDoc.title}" (Ctrl+S)` : 'Save document to cloud (Ctrl+S)'}
+          >
+            {isSavingDirectly ? (
+              <RefreshCw size={14} className="animate-spin" />
+            ) : (
+              <CloudUpload size={14} />
+            )}
+            <span>{isSavingDirectly ? 'Saving...' : (activeCloudDoc ? 'Save' : 'Save to Cloud')}</span>
+            {isCloudDocDirty && (
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-300" title="Unsaved changes"></span>
+            )}
+          </button>
+
+          {activeCloudDoc && (
+            <button
+              onClick={() => handleOpenCloudModal('save')}
+              className="flex items-center gap-1 px-2.5 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 rounded-lg font-semibold text-xs transition cursor-pointer"
+              title="Save as a new copy or change document details"
+            >
+              <span>Save As...</span>
+            </button>
+          )}
+
+          <div className="h-6 w-[1px] bg-slate-200 my-auto mx-0.5"></div>
 
           <button
             onClick={() => {
               if (fileInputRef.current) fileInputRef.current.click();
             }}
-            className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white font-semibold text-xs transition shadow-sm"
+            className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 rounded-lg font-semibold text-xs transition shadow-xs"
           >
             <ImageIcon size={14} />
             Import Trace Image
@@ -4458,39 +4635,12 @@ export default function App() {
 
           <button
             onClick={() => setIsImageTraceModalOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 rounded-lg text-white font-semibold text-xs transition shadow-sm cursor-pointer"
+            className="flex items-center gap-1.5 px-3 py-2 bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-700 rounded-lg font-semibold text-xs transition shadow-xs cursor-pointer"
             title="Image Trace: Vectorize bitmap images into clean Bézier paths using Marching Squares and Chaikin subdivision"
           >
             <Wand2 size={14} />
             Image Trace
           </button>
-
-          <button
-            onClick={handleExportProject}
-            className="flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 hover:text-slate-900 rounded-lg font-semibold text-xs transition shadow-sm cursor-pointer"
-            title="Save working project file (.json) to resume later"
-          >
-            <Save size={14} />
-            Save Project
-          </button>
-
-          <button
-            onClick={() => {
-              if (projectFileInputRef.current) projectFileInputRef.current.click();
-            }}
-            className="flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 hover:text-slate-900 rounded-lg font-semibold text-xs transition shadow-sm cursor-pointer"
-            title="Open/Upload a previously saved working project file (.json)"
-          >
-            <FolderOpen size={14} />
-            Open Project
-          </button>
-          <input
-            type="file"
-            ref={projectFileInputRef}
-            onChange={handleImportProject}
-            accept=".json,application/json"
-            className="hidden"
-          />
 
           <div className="h-6 w-[1px] bg-slate-200 my-auto mx-0.5"></div>
 
@@ -7150,6 +7300,21 @@ export default function App() {
         artboardHeight={artboardHeight}
         currentStrokeColor={strokeColor}
         currentFillColor={fillColor}
+      />
+
+      {/* Cloud Documents (Multi-computer Classroom Library) Modal */}
+      <CloudDocumentsModal
+        isOpen={isCloudModalOpen}
+        onClose={() => setIsCloudModalOpen(false)}
+        initialMode={cloudModalMode}
+        currentLayers={layers}
+        currentTracingImage={tracingImage}
+        currentArtboardWidth={artboardWidth}
+        currentArtboardHeight={artboardHeight}
+        currentUnit={unit}
+        activeCloudDoc={activeCloudDoc}
+        onLoadDocument={handleLoadCloudDocument}
+        onSavedDocument={handleSavedCloudDocument}
       />
 
       {/* Right-Click Context Menu */}

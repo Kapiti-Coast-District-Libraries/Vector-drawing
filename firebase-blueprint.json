@@ -1,0 +1,80 @@
+{
+  "entities": {
+    "Document": {
+      "title": "Document",
+      "description": "A vector design document saved to cloud for lessons without requiring login",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Title of the vector project",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "studentName": {
+          "type": "string",
+          "description": "Name or identifier of the student/maker",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "lessonName": {
+          "type": "string",
+          "description": "Lesson, class, or workshop title",
+          "maxLength": 100
+        },
+        "layers": {
+          "type": "array",
+          "description": "Native vector layers with paths, nodes, and styling"
+        },
+        "tracingImage": {
+          "type": "object",
+          "description": "Optional reference JPEG/PNG image for tracing with position, scale, opacity"
+        },
+        "artboardWidth": {
+          "type": "number",
+          "description": "Artboard canvas width in screen pixels"
+        },
+        "artboardHeight": {
+          "type": "number",
+          "description": "Artboard canvas height in screen pixels"
+        },
+        "unit": {
+          "type": "string",
+          "description": "Measurement unit (mm, cm, in, px)",
+          "maxLength": 10
+        },
+        "thumbnailSvg": {
+          "type": "string",
+          "description": "Preview thumbnail SVG string",
+          "maxLength": 20000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp"
+        }
+      },
+      "required": [
+        "title",
+        "studentName",
+        "layers",
+        "artboardWidth",
+        "artboardHeight",
+        "unit",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/documents/{documentId}": {
+      "schema": "Document",
+      "description": "Saved vector design documents accessible across computers without login"
+    }
+  }
+}

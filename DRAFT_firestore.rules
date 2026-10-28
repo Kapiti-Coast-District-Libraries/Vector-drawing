@@ -1,0 +1,55 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidDocument(data) {
+      return data.keys().hasAll(['title', 'studentName', 'layers', 'artboardWidth', 'artboardHeight', 'unit', 'updatedAt'])
+        && data.keys().hasOnly(['title', 'studentName', 'lessonName', 'layers', 'tracingImage', 'artboardWidth', 'artboardHeight', 'unit', 'thumbnailSvg', 'createdAt', 'updatedAt'])
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 100
+        && data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 60
+        && (!('lessonName' in data) || (data.lessonName is string && data.lessonName.size() <= 100))
+        && data.layers is list && data.layers.size() <= 50
+        && (!('tracingImage' in data) || (data.tracingImage is map))
+        && data.artboardWidth is number && data.artboardWidth > 0 && data.artboardWidth <= 20000
+        && data.artboardHeight is number && data.artboardHeight > 0 && data.artboardHeight <= 20000
+        && data.unit is string && data.unit.size() <= 10
+        && (!('thumbnailSvg' in data) || (data.thumbnailSvg is string && data.thumbnailSvg.size() <= 20000));
+    }
+
+    match /documents/{documentId} {
+      allow get, list: if true;
+
+      allow create: if isValidId(documentId)
+        && isValidDocument(incoming())
+        && ('createdAt' in incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isValidId(documentId)
+        && isValidDocument(incoming())
+        && (!('createdAt' in incoming()) || !('createdAt' in existing()) || incoming().createdAt == existing().createdAt)
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'title', 'studentName', 'lessonName', 'layers', 'tracingImage', 'artboardWidth', 'artboardHeight', 'unit', 'thumbnailSvg', 'updatedAt'
+        ]);
+
+      allow delete: if isValidId(documentId);
+    }
+  }
+}
